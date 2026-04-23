@@ -10,10 +10,33 @@
  * relay doesn't care — anything that calls `write(chunk)` works.
  */
 
-import { RelayBuffer, createRelayWorker, type WorkerEnv } from "stream-relay/worker";
+import {
+  RelayBuffer,
+  createRelayWorker,
+  withDurableStorage,
+  type WorkerEnv,
+  type RelayOptions,
+} from "stream-relay/worker";
+
+// Flip this to true to make every stream survive DO eviction (and Workers
+// deploys, accidental restarts, multi-day resume windows). Costs one DO
+// storage write per chunk with debouncing. Default off because most uses
+// don't need it and in-memory is faster.
+const DURABLE = false;
 
 interface Payload {
   prompt?: string;
+  /** Per-token delay in ms (default 250). Set higher to simulate slow LLMs. */
+  wordDelayMs?: number;
+  /** Insert a longer pause every N tokens (default 5). */
+  pauseEvery?: number;
+  /** Length of the periodic pause in ms (default 1500). */
+  pauseDelayMs?: number;
+  /**
+   * Override token count. If omitted, splits prompt by whitespace. Useful
+   * for soak tests where you want N synthetic tokens without typing them.
+   */
+  tokenCount?: number;
 }
 
 interface Meta {
@@ -23,24 +46,46 @@ interface Meta {
 
 export class MyRelay extends RelayBuffer<Payload, Meta> {
   constructor(state: DurableObjectState, env: WorkerEnv) {
-    super(state, env, {
-      streamTtlMs: 15 * 60 * 1000, // keep finished streams 15min for resume
+    const baseOptions: RelayOptions<Payload, Meta> = {
+      streamTtlMs: 30 * 60 * 1000, // keep finished streams 30min for resume
       upstream: async ({ payload, write, heartbeat, signal }) => {
         const start = Date.now();
-        const words = (payload.prompt ?? "the quick brown fox jumps over the lazy dog")
-          .split(" ");
+        const wordDelay = payload.wordDelayMs ?? 250;
+        const pauseEvery = payload.pauseEvery ?? 5;
+        const pauseDelay = payload.pauseDelayMs ?? 1500;
+
+        const words = payload.tokenCount
+          ? Array.from({ length: payload.tokenCount }, (_, i) => `t${i}`)
+          : (payload.prompt ?? "the quick brown fox jumps over the lazy dog").split(" ");
 
         for (let i = 0; i < words.length; i++) {
           if (signal.aborted) break;
-          // Simulate variable latency (some "thinking", then a token).
-          await sleep(i % 5 === 0 ? 1500 : 250);
-          if (i % 5 === 0) heartbeat(); // long silent stretch — keep alive
+
+          // Periodic long silent stretch with heartbeats so the client's
+          // server-stall detector stays happy through tool-call-style pauses.
+          if (i > 0 && i % pauseEvery === 0) {
+            const heartbeats = Math.max(1, Math.floor(pauseDelay / 2000));
+            for (let h = 0; h < heartbeats; h++) {
+              await sleep(pauseDelay / heartbeats);
+              heartbeat();
+            }
+          }
+
+          await sleep(wordDelay);
           write((i === 0 ? "" : " ") + words[i]);
         }
 
         return { tokens: words.length, durationMs: Date.now() - start };
       },
-    });
+    };
+
+    // Same upstream, optional persistence layer. The relay still runs
+    // in-memory at full speed; storage writes happen in the background.
+    super(
+      state,
+      env,
+      DURABLE ? withDurableStorage(state, baseOptions) : baseOptions,
+    );
   }
 }
 

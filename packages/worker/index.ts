@@ -12,7 +12,7 @@
  * stream is guaranteed to land on the same instance.
  */
 
-import { createRelay, type RelayOptions, type Relay } from "../server";
+import { createRelay, type RelayOptions, type Relay, type FinalState } from "../server";
 import type { StartRequest } from "../shared/protocol";
 
 // Re-exported so users can construct option types without importing from
@@ -24,8 +24,149 @@ export type {
   UpstreamContext,
   FinalState,
   HydratedState,
+  KVStore,
 } from "../server";
-export { createRelay };
+export { createRelay, withKvStorage, kvFromCloudflare } from "../server";
+
+// ─────────────────────────────────────────────────────────────────────────
+// Durable Object storage helper
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Wraps relay options with DO-storage-backed persistence. The DO survives
+ * eviction because every chunk is written to `state.storage`. On rehydrate
+ * (DO instance recreated, e.g. after eviction or deploy), the buffer is
+ * read back from storage and the stream picks up where it left off.
+ *
+ * Use this when you want a stream to survive a Workers deploy, an
+ * accidental DO eviction, or simply a multi-day resume window.
+ *
+ *   export class MyRelay extends RelayBuffer {
+ *     constructor(state, env) {
+ *       super(state, env, withDurableStorage(state, {
+ *         upstream: async ({ payload, write }) => { ... },
+ *       }));
+ *     }
+ *   }
+ *
+ * Cost: one storage write per chunk (with debouncing) plus one read on
+ * cold start. For LLM token streams that's typically 100-1000 writes
+ * per stream, well within free tier on most plans.
+ */
+export function withDurableStorage<TPayload, TMeta>(
+  state: DurableObjectState,
+  options: RelayOptions<TPayload, TMeta>,
+): RelayOptions<TPayload, TMeta> {
+  const flushInterval =
+    (options as { flushIntervalMs?: number }).flushIntervalMs ?? 500;
+
+  // Per-stream pending state. Same debounce idea as the KV adapter,
+  // adapted to DO storage's API.
+  const flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const pendingBuffer = new Map<string, string>();
+
+  const scheduleFlush = (id: string, getState: () => unknown) => {
+    if (flushTimers.has(id)) return;
+    const timer = setTimeout(async () => {
+      flushTimers.delete(id);
+      try {
+        await state.storage.put(`relay:${id}`, getState());
+      } catch (err) {
+        console.error("[stream-relay] DO flush failed", err);
+      }
+    }, flushInterval);
+    flushTimers.set(id, timer);
+  };
+
+  return {
+    ...options,
+
+    onAppend: async (id, chunk, offset) => {
+      const prior = pendingBuffer.get(id) ?? "";
+      const next = prior + chunk;
+      pendingBuffer.set(id, next);
+      const snapshot = {
+        buffer: next,
+        status: "streaming" as const,
+        lastEventAt: Date.now(),
+      };
+      if (flushInterval === 0) {
+        await state.storage.put(`relay:${id}`, snapshot);
+      } else {
+        scheduleFlush(id, () => snapshot);
+      }
+      if (options.onAppend) await options.onAppend(id, chunk, offset);
+    },
+
+    onComplete: async (id, final) => {
+      const t = flushTimers.get(id);
+      if (t) {
+        clearTimeout(t);
+        flushTimers.delete(id);
+      }
+      pendingBuffer.delete(id);
+      try {
+        await state.storage.put(`relay:${id}`, {
+          buffer: final.text,
+          status: "done",
+          lastEventAt: Date.now(),
+          final,
+        });
+      } catch (err) {
+        console.error("[stream-relay] DO complete write failed", err);
+      }
+      if (options.onComplete) await options.onComplete(id, final);
+    },
+
+    onError: async (id, message) => {
+      const t = flushTimers.get(id);
+      if (t) {
+        clearTimeout(t);
+        flushTimers.delete(id);
+      }
+      const buffer = pendingBuffer.get(id) ?? "";
+      pendingBuffer.delete(id);
+      try {
+        await state.storage.put(`relay:${id}`, {
+          buffer,
+          status: "error",
+          lastEventAt: Date.now(),
+          error: message,
+        });
+      } catch (err) {
+        console.error("[stream-relay] DO error write failed", err);
+      }
+      if (options.onError) await options.onError(id, message);
+    },
+
+    hydrate: async (id) => {
+      if (options.hydrate) {
+        const fromUser = await options.hydrate(id);
+        if (fromUser) return fromUser;
+      }
+      try {
+        const saved = await state.storage.get<{
+          buffer: string;
+          status: "streaming" | "done" | "error";
+          lastEventAt: number;
+          final?: FinalState<TMeta>;
+          error?: string;
+        }>(`relay:${id}`);
+        if (!saved) return null;
+        return {
+          buffer: saved.buffer,
+          status: saved.status,
+          lastEventAt: saved.lastEventAt,
+          final: saved.final,
+          error: saved.error,
+        };
+      } catch (err) {
+        console.error("[stream-relay] DO hydrate failed", err);
+        return null;
+      }
+    },
+  };
+}
 
 // ─────────────────────────────────────────────────────────────────────────
 // Durable Object: holds one stream's buffer in memory.

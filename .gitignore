@@ -5,3 +5,11 @@ dist/
 .DS_Store
 .env
 .env.local
+
+# Tests are run locally to validate changes; not committed (see README for
+# the full validation matrix).
+tests/
+vitest.config.ts
+scripts/
+hono-live-test.mjs
+soak-test.mjs

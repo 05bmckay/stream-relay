@@ -290,3 +290,5 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
 
 export type { StreamRecord };
 export type { PollResponse, StartRequest, StartResponse, StreamStatus } from "../shared/protocol";
+export { withKvStorage, kvFromCloudflare } from "./storage";
+export type { KVStore, KvStorageOptions } from "./storage";

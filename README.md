@@ -1,25 +1,29 @@
 # stream-relay
 
-> Resumable, pollable stream proxy for environments where the client can't hold long connections.
+Resumable, pollable stream proxy for clients that can't hold long connections.
 
-**Use this when:** your client (HubSpot UI extension, Salesforce LWC, embedded iframe, mobile webview) can only do short-lived `fetch()` calls, but your upstream (LLM, agent, long-running job) takes longer than the client's timeout window.
+If your frontend lives somewhere with a short fetch ceiling (HubSpot UI extensions, sandboxed iframes, embedded SaaS surfaces) and your backend takes longer than that ceiling allows (LLM calls, agent runs, slow APIs), this package sits between them. The client polls a small endpoint at 400ms; the server buffers the upstream response in memory; reloads pick up exactly where they left off.
 
-**Don't use this when:** you control both ends and can use plain SSE / WebSockets / streamed `fetch` responses. You don't need a proxy.
+## Drop-in by design
 
-## The problem
+You don't change how your client makes requests, you just point at the relay instead of the upstream and use a hook for the response. You don't change how your backend works either; the upstream handler receives a `write` function, you call it with chunks, the relay does the rest. Two endpoints (`POST /streams`, `GET /streams/:id`), one React hook, no SSE plumbing, no WebSocket configuration, no sticky load balancing.
 
-HubSpot UI extensions cap `fetch()` at 15s (recently raised to 120s, optionally). LLM and agent calls regularly run longer than that. Even when they don't, holding an SSE connection through a sandboxed fetch proxy is unreliable — connections drop, page reloads happen, and you lose the stream.
+## When to use it
+
+Reach for stream-relay when the client environment caps individual fetch calls and you can't switch transports. HubSpot extensions are the canonical case: even with the new 120s ceiling, holding an SSE connection through `hubspot.fetch` is unreliable, page reloads kill the stream, and you have no good answer for resume.
+
+If you control both ends and can use plain SSE or streamed `fetch` responses, you don't need this. Use those instead.
 
 ## How it works
 
 ```
-┌──────────────┐      poll every 400ms       ┌──────────────┐    long upstream     ┌──────────────┐
-│ React client │ ──────────────────────────▶ │ stream-relay │ ──────────────────▶ │  LLM / agent │
-│  useStream() │ ◀── { append, nextOffset } ─│   (server)   │ ◀── tokens ──────── │   / whatever │
-└──────────────┘                             └──────────────┘                     └──────────────┘
++------------------+      poll every 400ms       +------------------+    long upstream     +------------------+
+|   React client   | --------------------------> |   stream-relay   | -----------------> |   LLM / agent    |
+|   useStream()    | <-- { append, nextOffset }- |     (server)     | <-- tokens ------- |  / any slow API  |
++------------------+                             +------------------+                    +------------------+
 ```
 
-The relay buffers upstream output in memory. The client polls a tiny `GET /streams/:id?since=N` endpoint and asks for bytes past its last-known offset. Reload the page? Send the persisted offset, get exactly the bytes you missed. No SSE, no WebSockets, no sticky load balancing.
+The relay buffers upstream output in memory. The client polls `GET /streams/:id?since=N` and asks for bytes past its last-known offset. On reload, the client sends the persisted offset and gets exactly the bytes it missed. No SSE, no WebSockets, no sticky load balancing required.
 
 ## Install
 
@@ -27,11 +31,9 @@ The relay buffers upstream output in memory. The client polls a tiny `GET /strea
 npm install stream-relay
 ```
 
-One package, four entry points, only what you import gets bundled.
+One package, four entry points. Bundlers only pull in what you import.
 
-## Quickstart
-
-### Server (Cloudflare Workers)
+## Server: Cloudflare Workers
 
 ```ts
 // worker.ts
@@ -41,8 +43,6 @@ export class MyRelay extends RelayBuffer {
   constructor(state, env) {
     super(state, env, {
       upstream: async ({ payload, write }) => {
-        // Call your real upstream here. Anthropic, OpenAI, agent.ai,
-        // a slow internal API — anything. Stream tokens via write().
         for await (const token of callYourLLM(payload.prompt)) {
           write(token);
         }
@@ -65,9 +65,9 @@ tag = "v1"
 new_classes = ["MyRelay"]
 ```
 
-`wrangler deploy` and you're done.
+`wrangler deploy` and the relay is live.
 
-### Server (Node / Bun / Deno via Hono)
+## Server: Node, Bun, or Deno via Hono
 
 ```ts
 import { createRelayApp } from "stream-relay/hono";
@@ -84,25 +84,27 @@ const { app } = createRelayApp({
 serve({ fetch: app.fetch, port: 8787 });
 ```
 
-### Client (React, anywhere)
+## Client: React
 
 ```tsx
 import { useStream } from "stream-relay/client";
+import { useState } from "react";
 
-function Card() {
+function MyCard() {
   const [streamId, setStreamId] = useState(null);
   const [text, setText] = useState("");
 
   const { isStreaming, reconnecting } = useStream({
     proxyUrl: "https://your-relay.workers.dev",
     streamId,
-    fetcher: hubspot.fetch, // or plain `fetch` outside HubSpot
+    fetcher: hubspot.fetch,
     onChunk: (append) => setText((t) => t + append),
     onDone: ({ meta }) => console.log("usage:", meta),
   });
 
   const start = async () => {
-    const res = await fetch(`${RELAY_URL}/streams`, {
+    setText("");
+    const res = await hubspot.fetch(`${RELAY_URL}/streams`, {
       method: "POST",
       body: JSON.stringify({ payload: { prompt: "Tell me a joke" } }),
     });
@@ -113,7 +115,7 @@ function Card() {
   return (
     <>
       <button onClick={start} disabled={isStreaming}>
-        {reconnecting ? "Reconnecting…" : isStreaming ? "Running…" : "Run"}
+        {reconnecting ? "Reconnecting..." : isStreaming ? "Running..." : "Run"}
       </button>
       <div>{text}</div>
     </>
@@ -121,41 +123,83 @@ function Card() {
 }
 ```
 
-That's the whole API on the happy path.
+A complete HubSpot CRM card example with serverless-function-backed property persistence lives in [`examples/hubspot-extension/`](./examples/hubspot-extension/).
+
+## Bring your own stream IDs
+
+If you already track a `runId`, `jobId`, or any other stable identifier in your app, pass it as `streamId` on the start call and the relay uses it directly:
+
+```ts
+const res = await fetch(`${RELAY_URL}/streams`, {
+  method: "POST",
+  body: JSON.stringify({
+    streamId: existingRunId,
+    payload: { prompt: "..." },
+  }),
+});
+```
+
+The call is idempotent: re-posting the same `streamId` while a stream is live returns the existing stream's metadata without restarting the upstream. Saves you from persisting an extra ID alongside whatever you already track.
 
 ## Resuming after reload
 
-Persist `{ streamId, offset }` (returned from the hook) anywhere you like — `localStorage`, HubSpot card properties, your DB. On mount, re-supply them:
+The hook returns the current `offset`. Persist it alongside `streamId` (in `localStorage`, HubSpot card properties, your DB, anywhere). On the next mount, pass the saved offset back as `resumeFrom` and the hook delivers only the bytes that arrived while you were gone.
 
 ```tsx
 const { offset } = useStream({
   streamId: persisted.streamId,
-  resumeFrom: persisted.offset, // pick up exactly where we left off
+  resumeFrom: persisted.offset,
   // ...
 });
 ```
 
-If the relay has GC'd the buffer, `onError` fires with a `StreamNotFoundError` — caller decides whether to restart the upstream or surrender.
+If the relay garbage-collected the buffer before you came back, `onError` fires with a `StreamNotFoundError`. Your app decides whether to restart the upstream or surrender.
 
 ## Persistence (optional)
 
-In-memory by default. Server restart = active streams die. For most uses (single-region edge deploy, LLM proxying) that's fine. If you want durability:
+Default behavior is in-memory. If the server restarts, in-flight streams die with it. For most uses (single-region edge deploy, LLM proxying) this is fine. When you need streams to survive deploys, evictions, or multi-day resume windows, opt into one of the bundled persistence helpers.
+
+### Cloudflare: Durable Object storage
 
 ```ts
-createRelayApp({
-  upstream: ...,
-  onAppend:   async (id, chunk, offset) => myDb.append(id, chunk),
-  onComplete: async (id, final)         => myDb.complete(id, final),
-  onError:    async (id, message)       => myDb.error(id, message),
-  hydrate:    async (id)                => myDb.load(id),
-});
+import { RelayBuffer, withDurableStorage } from "stream-relay/worker";
+
+export class MyRelay extends RelayBuffer {
+  constructor(state, env) {
+    super(state, env, withDurableStorage(state, {
+      upstream: async ({ payload, write }) => { /* ... */ },
+    }));
+  }
+}
 ```
 
-The relay calls these best-effort and never blocks the upstream on them.
+Every chunk is debounced into the DO's storage. On rehydrate (eviction, deploy, cold start) the buffer is read back transparently.
+
+### Hono / Node / anywhere: KV interface
+
+```ts
+import { createRelayApp, withKvStorage } from "stream-relay/hono";
+
+const myKv = {
+  get: (k) => redis.get(k),
+  set: (k, v) => redis.set(k, v),
+  delete: (k) => redis.del(k),
+};
+
+const { app } = createRelayApp(withKvStorage(myKv, {
+  upstream: async ({ payload, write }) => { /* ... */ },
+}));
+```
+
+`withKvStorage` accepts any `{ get, set, delete? }` shape. Drop in Redis, Upstash, Cloudflare KV (via `kvFromCloudflare`), or your own database. Writes are debounced (default 500ms); set `flushIntervalMs: 0` for synchronous-per-chunk durability.
+
+### Roll your own
+
+The persistence helpers are thin wrappers over four optional callbacks on `RelayOptions`. If you want different semantics (chunked storage, compression, multi-tenant key prefixing), wire `onAppend`, `onComplete`, `onError`, and `hydrate` directly. The relay core never reaches into storage.
 
 ## Auth
 
-stream-relay ships **no built-in auth**. Every host has different needs (HubSpot install verification, JWT, mTLS, API keys). Bring your own:
+This package does not ship built-in auth. Every host has different requirements (HubSpot install verification, JWT, mTLS, API keys), so we leave the choice to you:
 
 ```ts
 createRelayWorker({
@@ -167,56 +211,79 @@ createRelayWorker({
 });
 ```
 
+The same `auth` option works on both the Worker and Hono adapters.
+
 ## API reference
 
-### `useStream(options)` — `stream-relay/client`
+### `useStream(options)` from `stream-relay/client`
 
-See [`packages/client/index.ts`](./packages/client/index.ts) for full JSDoc. Key options:
-
-| Option | Default | Meaning |
+| Option | Default | Purpose |
 |---|---|---|
-| `proxyUrl` | (required) | Base URL of your deployed relay |
-| `streamId` | (required) | Stream to subscribe to (`null` = inert) |
-| `fetcher` | `fetch` | HTTP client (use `hubspot.fetch` in extensions) |
+| `proxyUrl` | required | Base URL of your deployed relay |
+| `streamId` | required | Stream to subscribe to (`null` = inert) |
+| `fetcher` | global `fetch` | HTTP client (use `hubspot.fetch` in extensions) |
 | `intervalMs` | 400 | Poll cadence |
-| `resumeFrom` | 0 | `0` / byte offset / `"live"` |
+| `resumeFrom` | 0 | Byte offset, or `"live"` to skip backlog |
 | `reconnect.serverStallMs` | 90000 | Give-up threshold for silent server |
-| `reconnect.staleResyncMs` | 3000 | Force `since=0` resync threshold |
+| `reconnect.staleResyncMs` | 3000 | Force-resync threshold for client |
 
-### `createRelay(options)` — `stream-relay/server`
+Full JSDoc on every option in [`packages/client/index.ts`](./packages/client/index.ts).
 
-Framework-agnostic core if you're rolling your own HTTP layer. Returns `{ handleStart, handlePoll }` — pure functions.
+### `createRelay(options)` from `stream-relay/server`
 
-### `createRelayApp(options)` — `stream-relay/hono`
+Framework-agnostic core if you're rolling your own HTTP layer. Returns `{ handleStart, handlePoll }` as pure async functions.
 
-Hono app with `POST /streams` and `GET /streams/:id` mounted. Drop into Node, Bun, Deno, Vercel, Lambda.
+### `createRelayApp(options)` from `stream-relay/hono`
 
-### `RelayBuffer` + `createRelayWorker()` — `stream-relay/worker`
+Hono app with `POST /streams` and `GET /streams/:id` mounted. Runs on Node, Bun, Deno, Vercel, AWS Lambda, or Cloudflare Pages.
 
-Cloudflare Workers + Durable Object. Subclass `RelayBuffer` to wire your upstream; `createRelayWorker()` returns the routing `fetch` handler.
+### `RelayBuffer`, `createRelayWorker()`, `withDurableStorage()` from `stream-relay/worker`
+
+Cloudflare Workers + Durable Object. Subclass `RelayBuffer` to wire your upstream; `createRelayWorker()` returns the routing `fetch` handler; `withDurableStorage()` opts into DO-backed durability.
+
+### `withKvStorage(kv, options)` from `stream-relay/server`
+
+Persistence helper for any KV-shaped store. Accepts `{ get, set, delete? }`. Use directly with `createRelay` or wrap a Hono app's options.
 
 ## Wire protocol
 
-If you want to implement a relay in another language, the contract is tiny:
+The contract is small enough to reimplement in any language:
 
 ```
-POST /streams          { streamId?, payload? }       → { streamId, startedAt }
+POST /streams          { streamId?, payload? }
+                       -> { streamId, startedAt }
+
 GET  /streams/:id?since=N
-                       → { status, append, nextOffset, lastEventAt, serverNow,
-                           final?: { text, meta? }, error? }
+                       -> { status, append, nextOffset, lastEventAt, serverNow,
+                            final?: { text, meta? }, error? }
 ```
 
-`status` is `"streaming" | "done" | "error" | "not_found"`. The client uses `serverNow - lastEventAt > serverStallMs` to detect dead streams. That's it.
+`status` is one of `streaming`, `done`, `error`, `not_found`. Clients use `serverNow - lastEventAt > serverStallMs` to detect dead streams without trusting their own clock.
 
-## Why not...
+## What we tested
 
-- **Vercel `resumable-stream`** — Redis pub/sub + SSE. Doesn't help when the client environment can't hold an SSE connection (HubSpot fetch proxy, sandboxed iframes). Different problem.
-- **Inngest / Trigger.dev / Defer** — workflow engines. Way more than you need; their clients aren't built for token-by-token UI streaming.
-- **Convex / Liveblocks / Replicache** — sync engines. Adopt-a-backend, not a 200-line proxy.
+The package was built test-driven. Validation runs through:
+
+- **Unit tests** against the framework-agnostic core: happy path, error cases, idempotent start, heartbeat behavior, persistence hooks, rehydration, resume semantics, concurrent polls, out-of-range offset clamping.
+- **Integration tests** against a live Hono server: full HTTP round-trips, mid-stream disconnect-and-resume, multiple concurrent clients on the same stream, idempotent POST behavior with user-supplied IDs.
+- **Stress tests**: bursty streams with simulated tool-call pauses, 50 concurrent streams running in parallel, five disconnect-and-reconnect cycles on a single stream.
+- **Hono live test**: spins up a real `@hono/node-server`, exercises basic streaming, mid-stream resume, and 10 concurrent streams.
+- **Worker live test**: against the `wrangler dev` Cloudflare runtime with real Durable Objects, exercises basic streaming, mid-stream resume across simulated reload, and 10 concurrent streams across distinct DO instances.
+- **Soak test**: a 12-minute single stream (720 tokens at 1s cadence with periodic 4-second silent phases protected by server heartbeats), one mid-stream reload at the 5-minute mark, and full byte-level verification of the result.
+
+## Comparisons
+
+A few things in adjacent territory and why they don't fit this problem.
+
+Vercel's `resumable-stream` package solves resume after a dropped SSE connection using Redis pub/sub. It assumes the client environment can hold an SSE connection in the first place, which doesn't help when the fetch surface caps you at 15 or 120 seconds.
+
+Inngest, Trigger.dev, Defer, and similar workflow engines durably execute long-running jobs. They're full backends with their own opinions, and their clients are built for "render the final result" rather than token-by-token UI streaming.
+
+Convex, Liveblocks, and Replicache are sync engines. They solve a superset of this problem at the cost of adopting an entire backend paradigm.
 
 ## Status
 
-Pre-alpha. API may change. Feedback and issues welcome.
+Pre-alpha. The wire protocol and hook surface may shift before 1.0. Issues and feedback welcome.
 
 ## License
 
