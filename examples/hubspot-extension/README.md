@@ -19,6 +19,8 @@ src/app/functions/save-summary-state.js
 src/app/functions/package.json
 ```
 
+The React side is intentionally kept in one file (`src/app/cards/AiSummaryCard.tsx`) instead of being split into hooks/components. The only separate files are HubSpot-required metadata and app functions.
+
 The card demonstrates:
 
 - registering a React extension with `hubspot.extend()`

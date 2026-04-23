@@ -14,67 +14,36 @@ import {
 import { StreamNotFoundError, useStream } from "stream-relay/client";
 
 const RELAY_URL = "https://your-relay.workers.dev";
-const PROP_STREAM_ID = "ai_summary_stream_id";
-const PROP_STREAM_OFFSET = "ai_summary_stream_offset";
-const PROP_LAST_SUMMARY = "ai_summary_text";
 
-type HubSpotContext = {
-  crm?: {
-    objectId?: number | string;
-    objectTypeId?: string;
-  };
-};
-
-type AlertType = "info" | "tip" | "success" | "warning" | "danger";
-
-type AddAlert = (alert: {
-  title?: string;
-  message: string;
-  type?: AlertType;
-}) => void;
-
-type RunServerlessFunction = (request: {
-  name: string;
-  parameters?: Record<string, unknown>;
-}) => Promise<{ response?: unknown }>;
-
-type SummaryState = {
-  properties?: Partial<Record<typeof PROP_STREAM_ID | typeof PROP_STREAM_OFFSET | typeof PROP_LAST_SUMMARY, string>>;
-};
-
-type AiSummaryCardProps = {
-  context: HubSpotContext;
-  runServerlessFunction: RunServerlessFunction;
-  addAlert: AddAlert;
+const SUMMARY_PROPS = {
+  streamId: "ai_summary_stream_id",
+  offset: "ai_summary_stream_offset",
+  summary: "ai_summary_text",
 };
 
 hubspot.extend<"crm.record.tab">(({ context, runServerlessFunction, actions }) => (
   <AiSummaryCard
-    context={context as HubSpotContext}
-    runServerlessFunction={runServerlessFunction as RunServerlessFunction}
-    addAlert={actions.addAlert as AddAlert}
+    context={context}
+    runServerlessFunction={runServerlessFunction}
+    addAlert={actions.addAlert}
   />
 ));
 
-function AiSummaryCard({
-  context,
-  runServerlessFunction,
-  addAlert,
-}: AiSummaryCardProps) {
+function AiSummaryCard({ context, runServerlessFunction, addAlert }: any) {
   const contactId = context.crm?.objectId;
 
+  const [hydrating, setHydrating] = useState(true);
   const [streamId, setStreamId] = useState<string | null>(null);
   const [resumeFrom, setResumeFrom] = useState(0);
-  const [text, setText] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [hydrating, setHydrating] = useState(true);
+  const [summary, setSummary] = useState("");
+  const [error, setError] = useState("");
 
   useEffect(() => {
     let cancelled = false;
 
-    async function hydrate() {
+    async function loadSavedState() {
       if (!contactId) {
-        setError("This card must be opened on a contact record.");
+        setError("Open this card on a contact record to generate a summary.");
         setHydrating(false);
         return;
       }
@@ -87,13 +56,12 @@ function AiSummaryCard({
 
         if (cancelled) return;
 
-        const state = result.response as SummaryState | undefined;
-        const properties = state?.properties ?? {};
-        const savedSummary = properties[PROP_LAST_SUMMARY];
-        const savedStreamId = properties[PROP_STREAM_ID];
-        const savedOffset = Number(properties[PROP_STREAM_OFFSET] ?? 0);
+        const properties = result.response?.properties || {};
+        const savedSummary = properties[SUMMARY_PROPS.summary];
+        const savedStreamId = properties[SUMMARY_PROPS.streamId];
+        const savedOffset = Number(properties[SUMMARY_PROPS.offset] || 0);
 
-        if (savedSummary) setText(savedSummary);
+        if (savedSummary) setSummary(savedSummary);
         if (savedStreamId) {
           setStreamId(savedStreamId);
           setResumeFrom(Number.isFinite(savedOffset) ? savedOffset : 0);
@@ -107,7 +75,7 @@ function AiSummaryCard({
       }
     }
 
-    hydrate();
+    loadSavedState();
 
     return () => {
       cancelled = true;
@@ -119,18 +87,23 @@ function AiSummaryCard({
     streamId,
     fetcher: hubspot.fetch,
     resumeFrom,
-    onChunk: (append) => setText((previous) => previous + append),
-    onDone: ({ text: finalText }) => {
-      void saveState(runServerlessFunction, contactId, {
-        summary: finalText,
+    onChunk: (append) => setSummary((current) => current + append),
+    onDone: ({ text }) => {
+      void saveSummaryState(runServerlessFunction, contactId, {
+        summary: text,
         streamId: null,
         offset: 0,
       });
-      addAlert({ type: "success", title: "AI summary complete", message: "The summary was saved to the contact." });
+
+      addAlert({
+        type: "success",
+        title: "AI summary complete",
+        message: "The summary was saved to the contact.",
+      });
     },
     onError: (err) => {
       if (err instanceof StreamNotFoundError) {
-        setError("The saved relay stream expired. Click Generate to start a new summary.");
+        setError("The saved relay stream expired. Click Generate to start again.");
         setStreamId(null);
         setResumeFrom(0);
         return;
@@ -143,17 +116,17 @@ function AiSummaryCard({
   useEffect(() => {
     if (!contactId || !streamId || !isStreaming) return;
 
-    void saveState(runServerlessFunction, contactId, {
+    void saveSummaryState(runServerlessFunction, contactId, {
       streamId,
       offset,
     });
   }, [contactId, isStreaming, offset, runServerlessFunction, streamId]);
 
-  const start = async () => {
+  async function startSummary() {
     if (!contactId) return;
 
-    setText("");
-    setError(null);
+    setSummary("");
+    setError("");
     setResumeFrom(0);
 
     const response = await hubspot.fetch(`${RELAY_URL}/streams`, {
@@ -170,15 +143,15 @@ function AiSummaryCard({
       return;
     }
 
-    const body = (await response.json()) as { streamId: string };
+    const body = await response.json();
     setStreamId(body.streamId);
 
-    await saveState(runServerlessFunction, contactId, {
+    await saveSummaryState(runServerlessFunction, contactId, {
       streamId: body.streamId,
       offset: 0,
       summary: "",
     });
-  };
+  }
 
   if (hydrating) {
     return (
@@ -193,8 +166,8 @@ function AiSummaryCard({
       <Flex direction="column" gap="md">
         <Flex direction="row" justify="between" align="center">
           <Heading>AI summary</Heading>
-          <Button variant="primary" onClick={start} disabled={isStreaming || !contactId}>
-            {isStreaming ? (reconnecting ? "Reconnecting..." : "Generating...") : text ? "Regenerate" : "Generate"}
+          <Button variant="primary" onClick={startSummary} disabled={isStreaming || !contactId}>
+            {isStreaming ? (reconnecting ? "Reconnecting..." : "Generating...") : summary ? "Regenerate" : "Generate"}
           </Button>
         </Flex>
 
@@ -212,8 +185,8 @@ function AiSummaryCard({
 
         <Divider />
 
-        {text ? (
-          <Text>{text}</Text>
+        {summary ? (
+          <Text>{summary}</Text>
         ) : (
           <EmptyState title="No summary yet" layout="vertical">
             <Text>Click Generate to produce an AI summary of this contact's recent activity.</Text>
@@ -224,15 +197,7 @@ function AiSummaryCard({
   );
 }
 
-async function saveState(
-  runServerlessFunction: RunServerlessFunction,
-  contactId: number | string | undefined,
-  state: {
-    streamId?: string | null;
-    offset?: number;
-    summary?: string;
-  }
-) {
+async function saveSummaryState(runServerlessFunction: any, contactId: string | number | undefined, state: any) {
   if (!contactId) return;
 
   await runServerlessFunction({
