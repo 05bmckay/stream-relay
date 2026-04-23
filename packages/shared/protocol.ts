@@ -1,0 +1,91 @@
+/**
+ * Wire protocol shared by client and server. This file is the source of truth
+ * for what the relay endpoint returns and what the client expects.
+ *
+ * The protocol is intentionally tiny:
+ *   - One POST to start (`StartRequest` → `StartResponse`)
+ *   - One GET to poll (`?since=N` → `PollResponse`)
+ *   - That's it.
+ *
+ * Everything else (auth, rate limiting, persistence) is the host app's job
+ * and lives outside this package.
+ */
+
+export type StreamStatus = "streaming" | "done" | "error" | "not_found";
+
+export interface StartRequest {
+  /**
+   * Optional client-supplied id. If omitted, the server generates one and
+   * returns it in `StartResponse.streamId`. Supplying an id makes the call
+   * idempotent — re-POSTing the same id while a stream is live is a no-op
+   * and returns the existing stream's metadata.
+   */
+  streamId?: string;
+
+  /**
+   * Opaque payload forwarded to the upstream handler the host app
+   * registered with `createRelay({ upstream })`. The relay package never
+   * inspects this — it's the contract between the caller and their own
+   * upstream.
+   */
+  payload?: unknown;
+}
+
+export interface StartResponse {
+  streamId: string;
+  /** Server time at start, ms since epoch. Useful for clock-skew debugging. */
+  startedAt: number;
+}
+
+export interface PollResponse<TMeta = unknown> {
+  status: StreamStatus;
+
+  /**
+   * New bytes appended since the `since` offset the client requested.
+   * Empty string when no new data this tick.
+   */
+  append: string;
+
+  /**
+   * Absolute byte offset after `append`. The next poll should send
+   * `?since=nextOffset` (the client hook handles this automatically).
+   */
+  nextOffset: number;
+
+  /**
+   * Server's monotonic timestamp of the most recent upstream event, even
+   * silent ones (tool calls, thinking deltas). The client uses this to
+   * detect genuinely-dead streams vs. legitimately-quiet long operations.
+   *
+   * ms since epoch.
+   */
+  lastEventAt: number;
+
+  /**
+   * Server's current wall clock when this response was generated, ms since
+   * epoch. Pair with `lastEventAt` to compute "how long since the server
+   * last saw activity" without trusting the client's clock.
+   */
+  serverNow: number;
+
+  /**
+   * Populated when `status === "done"`. The full final buffer plus whatever
+   * structured metadata the host app attached on completion.
+   */
+  final?: {
+    text: string;
+    meta?: TMeta;
+  };
+
+  /** Populated when `status === "error"`. Human-readable message. */
+  error?: string;
+}
+
+/**
+ * Default URL paths. Hosts can mount the relay anywhere; these are just the
+ * conventional defaults the example servers and the client hook assume.
+ */
+export const DEFAULT_PATHS = {
+  start: "/streams",
+  poll: "/streams/:id",
+} as const;

@@ -1,0 +1,13 @@
+name = "stream-relay-example"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+# The DO holds a single stream's buffer in memory. We key it by streamId
+# (via idFromName) so every poll for one stream lands on the same instance.
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "MyRelay"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["MyRelay"]
