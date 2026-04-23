@@ -64,11 +64,10 @@ export interface KvStorageOptions {
  */
 export function withKvStorage<TPayload, TMeta>(
   kv: KVStore,
-  options: RelayOptions<TPayload, TMeta>,
+  options: RelayOptions<TPayload, TMeta> & KvStorageOptions,
 ): RelayOptions<TPayload, TMeta> {
-  const prefix = (options as { prefix?: string }).prefix ?? "stream-relay:";
-  const flushInterval =
-    (options as { flushIntervalMs?: number }).flushIntervalMs ?? 500;
+  const prefix = options.prefix ?? "stream-relay:";
+  const flushInterval = options.flushIntervalMs ?? 500;
 
   // Per-stream batched writers. A trailing-edge debounce: chunks within
   // `flushInterval` accumulate, then one write fires. The latest chunk's
@@ -131,7 +130,6 @@ export function withKvStorage<TPayload, TMeta>(
     },
 
     onComplete: async (id, final) => {
-      const prior = pendingState.get(id);
       const state: PersistedState<TMeta> = {
         buffer: final.text,
         status: "done",

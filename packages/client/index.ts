@@ -2,9 +2,9 @@
  * React hook for consuming a relay stream.
  *
  * Polls the relay's `GET /streams/:id` endpoint at a fixed cadence, delivers
- * new bytes via `onChunk`, and surfaces lifecycle via `onDone` / `onError`.
+ * new string data via `onChunk`, and surfaces lifecycle via `onDone` / `onError`.
  *
- * The hook is deliberately byte-oriented: the relay shuttles strings, and
+ * The hook is deliberately string-oriented: the relay shuttles strings, and
  * the caller decides how to interpret them (plain text, markdown, NDJSON,
  * a custom event format). Anything richer than that belongs in a wrapper
  * hook, not here.
@@ -55,7 +55,7 @@ export interface UseStreamOptions<TMeta = unknown> {
   /**
    * Where to start reading from on subscribe.
    *   - `0` (default): replay everything the relay still has buffered
-   *   - `N`: resume from byte N (use after reload, paired with persisted offset)
+   *   - `N`: resume from string offset N (use after reload, paired with persisted offset)
    *   - `"live"`: skip backlog, only deliver new chunks from now
    */
   resumeFrom?: number | "live";
@@ -138,6 +138,7 @@ export function useStream<TMeta = unknown>(
     const fetchImpl = fetcher ?? fetch;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let inFlight: AbortController | null = null;
 
     // Resolve initial offset.
     //   "live" → ask for current end-of-buffer; we'll seed from first poll.
@@ -159,6 +160,7 @@ export function useStream<TMeta = unknown>(
       if (cancelled) return;
       cancelled = true;
       if (timer) clearTimeout(timer);
+      if (inFlight) inFlight.abort();
       if (phase !== "cancel") {
         setIsStreaming(false);
         setReconnecting(false);
@@ -186,12 +188,16 @@ export function useStream<TMeta = unknown>(
 
       let res: Response;
       try {
+        inFlight = new AbortController();
         res = await fetchImpl(
           `${proxyUrl}/streams/${encodeURIComponent(streamId)}?since=${sinceParam}`,
-          { method: "GET" },
+          { method: "GET", signal: inFlight.signal },
         );
       } catch (err) {
+        if (cancelled) return { done: true, nextDelay: 0 };
         return handleTransientError(err);
+      } finally {
+        inFlight = null;
       }
 
       if (cancelled) return { done: true, nextDelay: 0 };
@@ -222,7 +228,7 @@ export function useStream<TMeta = unknown>(
         currentOffset = data.nextOffset;
         setOffset(currentOffset);
       } else if (stale) {
-        // Resync: server may have bytes we missed. Slice from our offset.
+        // Resync: server may have string data we missed. Slice from our offset.
         if (data.nextOffset > currentOffset) {
           // `append` here is buffer.slice(0); take only what we need.
           const tail =

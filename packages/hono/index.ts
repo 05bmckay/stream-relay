@@ -66,7 +66,7 @@ export function createRelayApp<TPayload = unknown, TMeta = unknown>(
   return { app, relay };
 }
 
-export { createRelay } from "../server";
+export { createRelay, withKvStorage, kvFromCloudflare } from "../server";
 export type {
   Relay,
   RelayOptions,
@@ -74,4 +74,6 @@ export type {
   UpstreamContext,
   FinalState,
   HydratedState,
+  KVStore,
+  KvStorageOptions,
 } from "../server";

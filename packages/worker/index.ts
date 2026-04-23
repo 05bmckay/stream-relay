@@ -25,6 +25,7 @@ export type {
   FinalState,
   HydratedState,
   KVStore,
+  KvStorageOptions,
 } from "../server";
 export { createRelay, withKvStorage, kvFromCloudflare } from "../server";
 
@@ -33,13 +34,14 @@ export { createRelay, withKvStorage, kvFromCloudflare } from "../server";
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
- * Wraps relay options with DO-storage-backed persistence. The DO survives
- * eviction because every chunk is written to `state.storage`. On rehydrate
- * (DO instance recreated, e.g. after eviction or deploy), the buffer is
- * read back from storage and the stream picks up where it left off.
+ * Wraps relay options with DO-storage-backed persistence. Finished buffers
+ * survive eviction because chunks are written to `state.storage`. On rehydrate
+ * (DO instance recreated, e.g. after eviction or deploy), completed/errored
+ * buffers are read back from storage. Streams interrupted while still running
+ * rehydrate as errors because upstream work cannot be resumed generically.
  *
- * Use this when you want a stream to survive a Workers deploy, an
- * accidental DO eviction, or simply a multi-day resume window.
+ * Use this when you want completed stream output to survive a Workers deploy,
+ * an accidental DO eviction, or simply a multi-day resume window.
  *
  *   export class MyRelay extends RelayBuffer {
  *     constructor(state, env) {
@@ -53,24 +55,34 @@ export { createRelay, withKvStorage, kvFromCloudflare } from "../server";
  * cold start. For LLM token streams that's typically 100-1000 writes
  * per stream, well within free tier on most plans.
  */
+export interface DurableStorageOptions {
+  /** Coalesce storage writes within this window. Default: 500ms. Set 0 to write every chunk. */
+  flushIntervalMs?: number;
+}
+
 export function withDurableStorage<TPayload, TMeta>(
   state: DurableObjectState,
-  options: RelayOptions<TPayload, TMeta>,
+  options: RelayOptions<TPayload, TMeta> & DurableStorageOptions,
 ): RelayOptions<TPayload, TMeta> {
-  const flushInterval =
-    (options as { flushIntervalMs?: number }).flushIntervalMs ?? 500;
+  const flushInterval = options.flushIntervalMs ?? 500;
 
   // Per-stream pending state. Same debounce idea as the KV adapter,
   // adapted to DO storage's API.
   const flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const pendingBuffer = new Map<string, string>();
 
-  const scheduleFlush = (id: string, getState: () => unknown) => {
+  const scheduleFlush = (id: string) => {
     if (flushTimers.has(id)) return;
     const timer = setTimeout(async () => {
       flushTimers.delete(id);
+      const buffer = pendingBuffer.get(id);
+      if (buffer === undefined) return;
       try {
-        await state.storage.put(`relay:${id}`, getState());
+        await state.storage.put(`relay:${id}`, {
+          buffer,
+          status: "streaming" as const,
+          lastEventAt: Date.now(),
+        });
       } catch (err) {
         console.error("[stream-relay] DO flush failed", err);
       }
@@ -85,15 +97,14 @@ export function withDurableStorage<TPayload, TMeta>(
       const prior = pendingBuffer.get(id) ?? "";
       const next = prior + chunk;
       pendingBuffer.set(id, next);
-      const snapshot = {
-        buffer: next,
-        status: "streaming" as const,
-        lastEventAt: Date.now(),
-      };
       if (flushInterval === 0) {
-        await state.storage.put(`relay:${id}`, snapshot);
+        await state.storage.put(`relay:${id}`, {
+          buffer: next,
+          status: "streaming" as const,
+          lastEventAt: Date.now(),
+        });
       } else {
-        scheduleFlush(id, () => snapshot);
+        scheduleFlush(id);
       }
       if (options.onAppend) await options.onAppend(id, chunk, offset);
     },

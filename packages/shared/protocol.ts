@@ -41,14 +41,15 @@ export interface PollResponse<TMeta = unknown> {
   status: StreamStatus;
 
   /**
-   * New bytes appended since the `since` offset the client requested.
+   * New string data appended since the `since` offset the client requested.
    * Empty string when no new data this tick.
    */
   append: string;
 
   /**
-   * Absolute byte offset after `append`. The next poll should send
-   * `?since=nextOffset` (the client hook handles this automatically).
+   * Absolute JavaScript string offset (UTF-16 code units) after `append`.
+   * The next poll should send `?since=nextOffset` (the client hook handles
+   * this automatically).
    */
   nextOffset: number;
 

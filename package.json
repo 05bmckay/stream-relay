@@ -22,10 +22,6 @@
   ],
   "files": [
     "dist",
-    "client.d.ts",
-    "server.d.ts",
-    "worker.d.ts",
-    "hono.d.ts",
     "README.md"
   ],
   "exports": {
@@ -53,6 +49,9 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:live": "node scripts/live-test.mjs",
     "prepublishOnly": "tsup"
   },
   "peerDependencies": {

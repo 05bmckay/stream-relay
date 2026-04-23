@@ -23,7 +23,7 @@ If you control both ends and can use plain SSE or streamed `fetch` responses, yo
 +------------------+                             +------------------+                    +------------------+
 ```
 
-The relay buffers upstream output in memory. The client polls `GET /streams/:id?since=N` and asks for bytes past its last-known offset. On reload, the client sends the persisted offset and gets exactly the bytes it missed. No SSE, no WebSockets, no sticky load balancing required.
+The relay buffers upstream output in memory. The client polls `GET /streams/:id?since=N` and asks for string data past its last-known offset. On reload, the client sends the persisted offset and gets exactly the data it missed. No SSE, no WebSockets, no sticky load balancing required.
 
 ## Install
 
@@ -33,7 +33,55 @@ npm install stream-relay
 
 One package, four entry points. Bundlers only pull in what you import.
 
-## Server: Cloudflare Workers
+## Quickstart
+
+### Client: React
+
+```tsx
+import { useStream } from "stream-relay/client";
+import { useState } from "react";
+
+function MyCard() {
+  const [streamId, setStreamId] = useState(null);
+  const [text, setText] = useState("");
+
+  // Polls while streamId is set; each response includes only new text.
+  const { isStreaming, reconnecting } = useStream({
+    proxyUrl: "https://your-relay.workers.dev",
+    streamId,
+    fetcher: hubspot.fetch,
+    onChunk: (append) => setText((t) => t + append),
+    onDone: ({ meta }) => console.log("usage:", meta),
+  });
+
+  const start = async () => {
+    setText("");
+
+    // Starts the upstream work and returns immediately with a streamId.
+    const res = await hubspot.fetch(`${RELAY_URL}/streams`, {
+      method: "POST",
+      body: JSON.stringify({ payload: { prompt: "Tell me a joke" } }),
+    });
+    const { streamId } = await res.json();
+
+    // Setting streamId kicks off the polling loop above.
+    setStreamId(streamId);
+  };
+
+  return (
+    <>
+      <button onClick={start} disabled={isStreaming}>
+        {reconnecting ? "Reconnecting..." : isStreaming ? "Running..." : "Run"}
+      </button>
+      <div>{text}</div>
+    </>
+  );
+}
+```
+
+A complete HubSpot CRM card example with serverless-function-backed property persistence lives in [`examples/hubspot-extension/`](./examples/hubspot-extension/).
+
+### Server: Cloudflare Workers
 
 ```ts
 // worker.ts
@@ -67,7 +115,7 @@ new_classes = ["MyRelay"]
 
 `wrangler deploy` and the relay is live.
 
-## Server: Node, Bun, or Deno via Hono
+### Server: Node, Bun, or Deno via Hono
 
 ```ts
 import { createRelayApp } from "stream-relay/hono";
@@ -84,47 +132,6 @@ const { app } = createRelayApp({
 serve({ fetch: app.fetch, port: 8787 });
 ```
 
-## Client: React
-
-```tsx
-import { useStream } from "stream-relay/client";
-import { useState } from "react";
-
-function MyCard() {
-  const [streamId, setStreamId] = useState(null);
-  const [text, setText] = useState("");
-
-  const { isStreaming, reconnecting } = useStream({
-    proxyUrl: "https://your-relay.workers.dev",
-    streamId,
-    fetcher: hubspot.fetch,
-    onChunk: (append) => setText((t) => t + append),
-    onDone: ({ meta }) => console.log("usage:", meta),
-  });
-
-  const start = async () => {
-    setText("");
-    const res = await hubspot.fetch(`${RELAY_URL}/streams`, {
-      method: "POST",
-      body: JSON.stringify({ payload: { prompt: "Tell me a joke" } }),
-    });
-    const { streamId } = await res.json();
-    setStreamId(streamId);
-  };
-
-  return (
-    <>
-      <button onClick={start} disabled={isStreaming}>
-        {reconnecting ? "Reconnecting..." : isStreaming ? "Running..." : "Run"}
-      </button>
-      <div>{text}</div>
-    </>
-  );
-}
-```
-
-A complete HubSpot CRM card example with serverless-function-backed property persistence lives in [`examples/hubspot-extension/`](./examples/hubspot-extension/).
-
 ## Bring your own stream IDs
 
 If you already track a `runId`, `jobId`, or any other stable identifier in your app, pass it as `streamId` on the start call and the relay uses it directly:
@@ -139,11 +146,11 @@ const res = await fetch(`${RELAY_URL}/streams`, {
 });
 ```
 
-The call is idempotent: re-posting the same `streamId` while a stream is live returns the existing stream's metadata without restarting the upstream. Saves you from persisting an extra ID alongside whatever you already track.
+The call is idempotent while the old record is still retained: re-posting the same `streamId` returns the existing stream's metadata without restarting the upstream. Saves you from persisting an extra ID alongside whatever you already track.
 
 ## Resuming after reload
 
-The hook returns the current `offset`. Persist it alongside `streamId` (in `localStorage`, HubSpot card properties, your DB, anywhere). On the next mount, pass the saved offset back as `resumeFrom` and the hook delivers only the bytes that arrived while you were gone.
+The hook returns the current string `offset` (a JavaScript UTF-16 string offset). Persist it alongside `streamId` (in `localStorage`, HubSpot card properties, your DB, anywhere). On the next mount, pass the saved offset back as `resumeFrom` and the hook delivers only the data that arrived while you were gone.
 
 ```tsx
 const { offset } = useStream({
@@ -155,9 +162,11 @@ const { offset } = useStream({
 
 If the relay garbage-collected the buffer before you came back, `onError` fires with a `StreamNotFoundError`. Your app decides whether to restart the upstream or surrender.
 
+If nobody polls a still-running stream for `streamTtlMs` (10 minutes by default), the relay aborts the upstream via `ctx.signal` and marks the stream as `error`. Upstream handlers should pass `signal` into fetch/SDK calls when possible or check `signal.aborted` in long loops.
+
 ## Persistence (optional)
 
-Default behavior is in-memory. If the server restarts, in-flight streams die with it. For most uses (single-region edge deploy, LLM proxying) this is fine. When you need streams to survive deploys, evictions, or multi-day resume windows, opt into one of the bundled persistence helpers.
+Default behavior is in-memory. If the server restarts, in-flight streams die with it. For most uses (single-region edge deploy, LLM proxying) this is fine. When you need completed stream output to survive deploys, evictions, or multi-day resume windows, opt into one of the bundled persistence helpers.
 
 ### Cloudflare: Durable Object storage
 
@@ -173,7 +182,7 @@ export class MyRelay extends RelayBuffer {
 }
 ```
 
-Every chunk is debounced into the DO's storage. On rehydrate (eviction, deploy, cold start) the buffer is read back transparently.
+Every chunk is debounced into the DO's storage. On rehydrate (eviction, deploy, cold start), completed or errored buffers are read back transparently. If eviction interrupts an actively-running upstream, the stream rehydrates as an error because arbitrary upstream work cannot be resumed generically.
 
 ### Hono / Node / anywhere: KV interface
 
@@ -191,7 +200,7 @@ const { app } = createRelayApp(withKvStorage(myKv, {
 }));
 ```
 
-`withKvStorage` accepts any `{ get, set, delete? }` shape. Drop in Redis, Upstash, Cloudflare KV (via `kvFromCloudflare`), or your own database. Writes are debounced (default 500ms); set `flushIntervalMs: 0` for synchronous-per-chunk durability.
+`withKvStorage` accepts any `{ get, set, delete? }` shape. Drop in Redis, Upstash, Cloudflare KV (via `kvFromCloudflare`), or your own database. Writes are debounced (default 500ms); set `flushIntervalMs: 0` for synchronous-per-chunk durability. Use `prefix` to namespace keys when sharing a store.
 
 ### Roll your own
 
@@ -223,7 +232,7 @@ The same `auth` option works on both the Worker and Hono adapters.
 | `streamId` | required | Stream to subscribe to (`null` = inert) |
 | `fetcher` | global `fetch` | HTTP client (use `hubspot.fetch` in extensions) |
 | `intervalMs` | 400 | Poll cadence |
-| `resumeFrom` | 0 | Byte offset, or `"live"` to skip backlog |
+| `resumeFrom` | 0 | JavaScript string offset, or `"live"` to skip backlog |
 | `reconnect.serverStallMs` | 90000 | Give-up threshold for silent server |
 | `reconnect.staleResyncMs` | 3000 | Force-resync threshold for client |
 
@@ -231,7 +240,7 @@ Full JSDoc on every option in [`packages/client/index.ts`](./packages/client/ind
 
 ### `createRelay(options)` from `stream-relay/server`
 
-Framework-agnostic core if you're rolling your own HTTP layer. Returns `{ handleStart, handlePoll }` as pure async functions.
+Framework-agnostic core if you're rolling your own HTTP layer. Returns `{ handleStart, handlePoll }` as pure async functions. `streamTtlMs` controls both finished-buffer retention and inactivity aborts for still-running streams.
 
 ### `createRelayApp(options)` from `stream-relay/hono`
 
@@ -258,18 +267,18 @@ GET  /streams/:id?since=N
                             final?: { text, meta? }, error? }
 ```
 
-`status` is one of `streaming`, `done`, `error`, `not_found`. Clients use `serverNow - lastEventAt > serverStallMs` to detect dead streams without trusting their own clock.
+`status` is one of `streaming`, `done`, `error`, `not_found`. `since` and `nextOffset` are JavaScript string offsets (UTF-16 code units), matching the package's string-in/string-out API. Clients use `serverNow - lastEventAt > serverStallMs` to detect dead streams without trusting their own clock.
 
 ## What we tested
 
 The package was built test-driven. Validation runs through:
 
-- **Unit tests** against the framework-agnostic core: happy path, error cases, idempotent start, heartbeat behavior, persistence hooks, rehydration, resume semantics, concurrent polls, out-of-range offset clamping.
+- **Unit tests** against the framework-agnostic core: happy path, error cases, idempotent start, heartbeat behavior, persistence hooks, rehydration, interrupted-stream hydration, inactivity abort, resume semantics, concurrent polls, out-of-range offset clamping.
 - **Integration tests** against a live Hono server: full HTTP round-trips, mid-stream disconnect-and-resume, multiple concurrent clients on the same stream, idempotent POST behavior with user-supplied IDs.
 - **Stress tests**: bursty streams with simulated tool-call pauses, 50 concurrent streams running in parallel, five disconnect-and-reconnect cycles on a single stream.
 - **Hono live test**: spins up a real `@hono/node-server`, exercises basic streaming, mid-stream resume, and 10 concurrent streams.
 - **Worker live test**: against the `wrangler dev` Cloudflare runtime with real Durable Objects, exercises basic streaming, mid-stream resume across simulated reload, and 10 concurrent streams across distinct DO instances.
-- **Soak test**: a 12-minute single stream (720 tokens at 1s cadence with periodic 4-second silent phases protected by server heartbeats), one mid-stream reload at the 5-minute mark, and full byte-level verification of the result.
+- **Soak test**: a 12-minute single stream (720 tokens at 1s cadence with periodic 4-second silent phases protected by server heartbeats), one mid-stream reload at the 5-minute mark, and full string-level verification of the result.
 
 ## Comparisons
 

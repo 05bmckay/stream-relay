@@ -23,10 +23,10 @@ import type {
 
 /**
  * Function the host app provides to actually run the upstream work. Receives
- * the `payload` from `StartRequest` and a `writer` to push bytes back into
- * the relay buffer. Resolve to mark `done`; throw to mark `error`.
+ * the `payload` from `StartRequest` and a `writer` to push string data back
+ * into the relay buffer. Resolve to mark `done`; throw to mark `error`.
  *
- * The writer is intentionally byte-oriented (string in, string out). Hosts
+ * The writer is intentionally string-oriented (string in, string out). Hosts
  * doing structured streaming (JSON events, SSE frames) should serialize on
  * the way in and parse on the way out — keeps the relay dumb.
  */
@@ -37,7 +37,7 @@ export type UpstreamHandler<TPayload = unknown, TMeta = unknown> = (
 export interface UpstreamContext<TPayload = unknown, TMeta = unknown> {
   streamId: string;
   payload: TPayload;
-  /** Append bytes to the buffer. Bumps `lastEventAt`. */
+  /** Append string data to the buffer. Bumps `lastEventAt`. */
   write: (chunk: string) => void;
   /**
    * Bump `lastEventAt` without writing. Use during long silent operations
@@ -54,10 +54,9 @@ export interface RelayOptions<TPayload = unknown, TMeta = unknown> {
   upstream: UpstreamHandler<TPayload, TMeta>;
 
   /**
-   * Garbage-collect streams that haven't been polled in this long. Default
-   * 10 minutes. Set high if you want long resume windows, low if memory is
-   * tight. Streams in `streaming` status are never GC'd by inactivity —
-   * only finished/errored ones.
+   * Garbage-collect finished streams and abort streaming streams that haven't
+   * been polled in this long. Default 10 minutes. Set high if you want long
+   * resume windows, low if memory/upstream cost is tight.
    */
   streamTtlMs?: number;
 
@@ -79,7 +78,7 @@ export interface RelayOptions<TPayload = unknown, TMeta = unknown> {
 
   /**
    * ID generator for `POST /streams` when the client doesn't supply one.
-   * Defaults to a 16-byte hex string from `crypto.randomUUID()`.
+   * Defaults to `crypto.randomUUID()` where available.
    */
   generateId?: () => string;
 }
@@ -121,6 +120,7 @@ interface StreamRecord<TMeta = unknown> {
   final?: FinalState<TMeta>;
   error?: string;
   abort: AbortController;
+  inactivityTimer?: ReturnType<typeof setTimeout>;
 }
 
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
@@ -141,8 +141,36 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
     const now = Date.now();
     for (const [id, rec] of streams) {
       if (rec.status === "streaming") continue;
-      if (now - rec.lastPolledAt > ttl) streams.delete(id);
+      if (now - rec.lastPolledAt > ttl) {
+        if (rec.inactivityTimer) clearTimeout(rec.inactivityTimer);
+        streams.delete(id);
+      }
     }
+  }
+
+  function scheduleInactivityAbort(rec: StreamRecord<TMeta>) {
+    if (rec.inactivityTimer) clearTimeout(rec.inactivityTimer);
+    if (rec.status !== "streaming") return;
+
+    rec.inactivityTimer = setTimeout(() => {
+      if (rec.status !== "streaming") return;
+      const now = Date.now();
+      if (now - rec.lastPolledAt < ttl) {
+        scheduleInactivityAbort(rec);
+        return;
+      }
+
+      const message = "stream aborted after client inactivity";
+      rec.status = "error";
+      rec.error = message;
+      rec.lastEventAt = now;
+      rec.abort.abort();
+      if (options.onError) {
+        options
+          .onError(rec.streamId, message)
+          .catch((e) => console.error("[relay] onError hook failed", e));
+      }
+    }, ttl);
   }
 
   async function handleStart(req: StartRequest): Promise<StartResponse> {
@@ -167,6 +195,7 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
       abort,
     };
     streams.set(streamId, rec);
+    scheduleInactivityAbort(rec);
 
     // Fire-and-forget. Errors are caught and stored on the record; the
     // poll endpoint surfaces them. We deliberately don't `await` here —
@@ -202,6 +231,10 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
     try {
       const meta = await options.upstream(ctx);
       if (rec.status !== "streaming") return; // aborted
+      if (rec.inactivityTimer) {
+        clearTimeout(rec.inactivityTimer);
+        rec.inactivityTimer = undefined;
+      }
       const final: FinalState<TMeta> = {
         text: rec.buffer,
         meta: meta ?? undefined,
@@ -216,6 +249,10 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
       }
     } catch (err) {
       if (rec.status !== "streaming") return;
+      if (rec.inactivityTimer) {
+        clearTimeout(rec.inactivityTimer);
+        rec.inactivityTimer = undefined;
+      }
       const message = err instanceof Error ? err.message : String(err);
       rec.status = "error";
       rec.error = message;
@@ -239,18 +276,26 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
       const hydrated = await options.hydrate(streamId);
       if (hydrated) {
         const now = Date.now();
+        const interrupted = hydrated.status === "streaming";
         rec = {
           streamId,
           buffer: hydrated.buffer,
-          status: hydrated.status,
-          lastEventAt: hydrated.lastEventAt,
+          status: interrupted ? "error" : hydrated.status,
+          lastEventAt: interrupted ? now : hydrated.lastEventAt,
           lastPolledAt: now,
           startedAt: now,
           final: hydrated.final,
-          error: hydrated.error,
+          error: interrupted
+            ? "stream was interrupted before completion"
+            : hydrated.error,
           abort: new AbortController(),
         };
         streams.set(streamId, rec);
+        if (interrupted && options.onError) {
+          options
+            .onError(streamId, rec.error ?? "stream was interrupted before completion")
+            .catch((e) => console.error("[relay] onError hook failed", e));
+        }
       }
     }
 
@@ -266,8 +311,11 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
     }
 
     rec.lastPolledAt = now;
+    scheduleInactivityAbort(rec);
 
-    const safeSince = Math.max(0, Math.min(since, rec.buffer.length));
+    const safeSince = Number.isFinite(since)
+      ? Math.max(0, Math.min(since, rec.buffer.length))
+      : rec.buffer.length;
     const append = rec.buffer.slice(safeSince);
 
     return {
