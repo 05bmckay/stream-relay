@@ -10,6 +10,9 @@ dist/
 # the full validation matrix).
 tests/
 vitest.config.ts
-scripts/
 hono-live-test.mjs
 soak-test.mjs
+
+# scripts/release-github.mjs is committed; transient test scripts are not.
+scripts/live-test.mjs
+scripts/soak-test.mjs

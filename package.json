@@ -49,10 +49,11 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "test:live": "node scripts/live-test.mjs",
-    "prepublishOnly": "tsup"
+    "prepublishOnly": "tsup",
+    "release:patch": "npm version patch && npm publish && git push origin main --tags",
+    "release:minor": "npm version minor && npm publish && git push origin main --tags",
+    "release:major": "npm version major && npm publish && git push origin main --tags",
+    "release:github": "node scripts/release-github.mjs"
   },
   "peerDependencies": {
     "hono": ">=4",
