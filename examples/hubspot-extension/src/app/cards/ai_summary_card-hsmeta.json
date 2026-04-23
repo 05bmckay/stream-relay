@@ -1,0 +1,12 @@
+{
+  "config": {
+    "name": "AI Summary",
+    "location": "crm.record.tab",
+    "entrypoint": "/app/cards/AiSummaryCard.tsx",
+    "objectTypes": [
+      "contacts"
+    ]
+  },
+  "uid": "ai_summary_card",
+  "type": "card"
+}

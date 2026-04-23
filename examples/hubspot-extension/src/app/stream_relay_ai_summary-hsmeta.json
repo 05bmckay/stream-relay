@@ -1,0 +1,26 @@
+{
+  "config": {
+    "auth": {
+      "type": "static",
+      "optionalScopes": [],
+      "requiredScopes": [
+        "crm.objects.contacts.read",
+        "crm.objects.contacts.write"
+      ],
+      "conditionallyRequiredScopes": []
+    },
+    "name": "Stream Relay AI Summary",
+    "description": "HubSpot CRM card example for resumable AI streams with stream-relay.",
+    "isUserLevel": false,
+    "distribution": "PRIVATE",
+    "permittedUrls": {
+      "img": [],
+      "fetch": [
+        "https://your-relay.workers.dev"
+      ],
+      "iframe": []
+    }
+  },
+  "uid": "stream_relay_ai_summary",
+  "type": "app"
+}

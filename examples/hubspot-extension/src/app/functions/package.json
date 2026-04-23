@@ -1,0 +1,9 @@
+{
+  "name": "stream-relay-hubspot-functions",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "dependencies": {
+    "@hubspot/api-client": "^12.0.0"
+  }
+}

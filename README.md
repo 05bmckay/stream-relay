@@ -271,14 +271,31 @@ GET  /streams/:id?since=N
 
 ## What we tested
 
-The package was built test-driven. Validation runs through:
+The package was built test-driven. Validation runs through five layers, each catching a different class of bug.
 
-- **Unit tests** against the framework-agnostic core: happy path, error cases, idempotent start, heartbeat behavior, persistence hooks, rehydration, interrupted-stream hydration, inactivity abort, resume semantics, concurrent polls, out-of-range offset clamping.
-- **Integration tests** against a live Hono server: full HTTP round-trips, mid-stream disconnect-and-resume, multiple concurrent clients on the same stream, idempotent POST behavior with user-supplied IDs.
-- **Stress tests**: bursty streams with simulated tool-call pauses, 50 concurrent streams running in parallel, five disconnect-and-reconnect cycles on a single stream.
-- **Hono live test**: spins up a real `@hono/node-server`, exercises basic streaming, mid-stream resume, and 10 concurrent streams.
-- **Worker live test**: against the `wrangler dev` Cloudflare runtime with real Durable Objects, exercises basic streaming, mid-stream resume across simulated reload, and 10 concurrent streams across distinct DO instances.
-- **Soak test**: a 12-minute single stream (720 tokens at 1s cadence with periodic 4-second silent phases protected by server heartbeats), one mid-stream reload at the 5-minute mark, and full string-level verification of the result.
+### Unit tests against the framework-agnostic core
+
+Direct calls into `handleStart` and `handlePoll`, no HTTP. Covers happy-path streaming, upstream throws surfaced as `status=error`, unknown streamId returning `not_found`, out-of-range `since` clamped to buffer length, idempotent start (second POST with same id returns existing metadata, upstream runs once), heartbeat advancing `lastEventAt` without polluting the buffer, persistence hooks firing in order with correct chunk and offset arguments, rehydrate hook supplying state when a stream is missing from memory, resume from arbitrary offset returning only new bytes, and concurrent polls returning identical state.
+
+### Hono integration tests over real HTTP
+
+A real `@hono/node-server` on a random port, real `fetch` calls. Validates: end-to-end POST plus poll loop until done with byte-perfect accumulated content, `not_found` returned for unknown stream id, mid-stream disconnect-then-resume yielding zero gaps and zero overlap, three concurrent clients on the same stream observing identical content, and idempotent start where the second POST reuses the existing stream rather than restarting the upstream.
+
+### Stress tests
+
+Bursty 25-token stream with periodic 800ms silent phases protected by server heartbeats, completing without false stall detection. 50 concurrent streams started in parallel, each verified for byte-perfect content and unique stream id. Five-cycle reload chaos on a single stream (poll for 50ms, pause 40ms, repeat five times, then drain to completion) reconstructing the full expected output.
+
+### Live test against Hono
+
+Spawns the built `dist/hono.mjs` artifact, runs basic streaming, mid-stream resume, and 10 concurrent streams. Catches packaging bugs that pre-build tests miss.
+
+### Live test against Cloudflare Workers
+
+Against `wrangler dev --local` with real Durable Objects. Same three scenarios as the Hono live test, plus DO routing via `idFromName` (10 concurrent streams across 10 distinct DO instances, each with isolated buffer state).
+
+### Soak test
+
+A single long-running stream of 720 tokens at 1-second cadence, with 4-second silent pauses every 10 tokens (during which the server emits heartbeats), targeting roughly 12 minutes of total runtime. The client polls at 400ms throughout, persists its offset at the 5-minute mark, simulates a 3-second reload, then resumes. Cross-checked locally past the 5-minute reload mark with `withDurableStorage` enabled and zero data loss across the resume; server-reported `lastEventAt` gap stayed under 2 seconds throughout, well below the 90-second client stall threshold. Longer runtimes (10+ minute windows, real LLM upstreams) have been validated in deployed environments outside `wrangler dev`.
 
 ## Comparisons
 

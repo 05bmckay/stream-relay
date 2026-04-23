@@ -1,51 +1,87 @@
-# HubSpot CRM card example
+# HubSpot UI extension example
 
-A realistic HubSpot UI extension card that uses stream-relay to generate
-an AI summary for the current contact. Demonstrates:
+A complete HubSpot developer-platform app example for a CRM card that uses
+`stream-relay` to generate a resumable AI summary for the current contact.
 
-- Kicking off a long upstream call from `hubspot.fetch`
-- Streaming tokens into the card via `useStream`
-- Persisting `{streamId, offset}` to a contact property so a reload picks
-  up exactly where it left off
-- Handling `StreamNotFoundError` when a stream expires before resume
-- Showing the `reconnecting` affordance when polls drop
+This example follows the current HubSpot project layout used by the developer
+platform:
 
-## Required serverless functions
+```text
+hsproject.json
+src/app/stream_relay_ai_summary-hsmeta.json
+src/app/cards/ai_summary_card-hsmeta.json
+src/app/cards/AiSummaryCard.tsx
+src/app/cards/package.json
+src/app/functions/load-summary-state-hsmeta.json
+src/app/functions/load-summary-state.js
+src/app/functions/save-summary-state-hsmeta.json
+src/app/functions/save-summary-state.js
+src/app/functions/package.json
+```
 
-The card uses two serverless functions for state persistence:
+The card demonstrates:
 
-- `loadSummaryState({ contactId })` reads the three custom properties below
-  from the contact and returns them.
-- `saveSummaryState({ contactId, streamId?, offset?, summary? })` writes
-  whichever subset is supplied.
+- registering a React extension with `hubspot.extend()`
+- reading HubSpot context from the extension callback
+- using SDK actions such as `actions.addAlert`
+- starting relay work through `hubspot.fetch()`
+- polling streamed tokens with `useStream()`
+- persisting `{ streamId, offset, summary }` with HubSpot app functions
+- resuming from the last saved offset after a card reload
+- handling relay expiry with `StreamNotFoundError`
 
-Both are thin wrappers around the HubSpot Contacts API. Implement them in
-your project's `app.functions/` directory.
+## Configure the example
 
-## Required custom contact properties
-
-Create these in HubSpot before installing the card:
+1. Replace every `https://your-relay.workers.dev` value with your deployed
+   relay URL:
+   - `src/app/stream_relay_ai_summary-hsmeta.json` under `permittedUrls.fetch`
+   - `src/app/cards/AiSummaryCard.tsx` in `RELAY_URL`
+2. Create a HubSpot private app token with contact read/write access and add it
+   as the project secret `PRIVATE_APP_ACCESS_TOKEN`.
+3. Create these contact properties before installing the card:
 
 | Internal name | Type | Field type |
-|---|---|---|
+| --- | --- | --- |
 | `ai_summary_stream_id` | Single-line text | Text |
 | `ai_summary_stream_offset` | Number | Number |
 | `ai_summary_text` | Multi-line text | Multi-line text |
 
-## Required deps
+## Install dependencies
+
+HubSpot card and function dependencies are installed in their own app folders:
+
+```sh
+cd examples/hubspot-extension/src/app/cards
+npm install
+
+cd ../functions
+npm install
+```
+
+If you copy this into a separate HubSpot project instead of running it from this
+repository, change the card dependency from the local file reference to the npm
+package:
+
+```json
+"stream-relay": "latest"
+```
+
+or run:
 
 ```sh
 npm install stream-relay react @hubspot/ui-extensions
 ```
 
-## Where to put it
+## Develop and deploy
 
-Drop `AiSummaryCard.jsx` into your project at
-`src/app/extensions/AiSummaryCard.jsx`, then register it in your
-`hsproject.json` extension config like any other UI extension card.
+From `examples/hubspot-extension`, use the HubSpot CLI for the app/project
+lifecycle. From the card package you can run the UI extension dev server:
 
-## Pointing at your relay
+```sh
+cd src/app/cards
+npm run dev
+```
 
-Replace the `RELAY_URL` constant at the top of `AiSummaryCard.jsx` with
-your deployed relay's URL. The relay is the example in
-`../worker-llm/`; deploy it with `wrangler deploy` and use that URL.
+The relay server itself is not part of the HubSpot app. Use
+`examples/worker-llm/` as the relay backend, deploy it with `wrangler deploy`,
+and point this HubSpot app at that URL.

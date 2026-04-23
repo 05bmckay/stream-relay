@@ -1,0 +1,10 @@
+{
+  "config": {
+    "entrypoint": "app/functions/save-summary-state.js",
+    "secretKeys": [
+      "PRIVATE_APP_ACCESS_TOKEN"
+    ]
+  },
+  "uid": "save-summary-state",
+  "type": "app-function"
+}

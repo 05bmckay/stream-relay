@@ -18,11 +18,12 @@ import {
   type RelayOptions,
 } from "stream-relay/worker";
 
-// Flip this to true to make every stream survive DO eviction (and Workers
-// deploys, accidental restarts, multi-day resume windows). Costs one DO
-// storage write per chunk with debouncing. Default off because most uses
-// don't need it and in-memory is faster.
-const DURABLE = false;
+// Long streams (multi-minute LLM calls, agent runs) almost always want
+// this on: it makes every stream survive DO eviction, Workers deploys,
+// accidental restarts, and multi-day resume windows. Costs one DO storage
+// write per chunk with built-in debouncing. Flip to false only if you're
+// confident your streams complete inside a single DO lifetime.
+const DURABLE = true;
 
 interface Payload {
   prompt?: string;

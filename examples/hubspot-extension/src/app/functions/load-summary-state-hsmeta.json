@@ -1,0 +1,10 @@
+{
+  "config": {
+    "entrypoint": "app/functions/load-summary-state.js",
+    "secretKeys": [
+      "PRIVATE_APP_ACCESS_TOKEN"
+    ]
+  },
+  "uid": "load-summary-state",
+  "type": "app-function"
+}
