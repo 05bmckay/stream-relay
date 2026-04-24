@@ -10,7 +10,7 @@ You don't change how your client makes requests, you just point at the relay ins
 
 ## When to use it
 
-Reach for stream-relay when the client environment caps individual fetch calls and you can't switch transports. HubSpot extensions are the canonical case: even with the new 120s ceiling, holding an SSE connection through `hubspot.fetch` is unreliable, page reloads kill the stream, and you have no good answer for resume.
+Reach for stream-relay when the client environment caps individual fetch calls and you can't switch transports. HubSpot extensions are the canonical case: holding an SSE connection through `hubspot.fetch` is unreliable, page reloads kill the stream, and you have no good answer for resume.
 
 If you control both ends and can use plain SSE or streamed `fetch` responses, you don't need this. Use those instead.
 
@@ -301,7 +301,7 @@ A single long-running stream of 720 tokens at 1-second cadence, with 4-second si
 
 A few things in adjacent territory and why they don't fit this problem.
 
-Vercel's `resumable-stream` package solves resume after a dropped SSE connection using Redis pub/sub. It assumes the client environment can hold an SSE connection in the first place, which doesn't help when the fetch surface caps you at 15 or 120 seconds.
+Vercel's `resumable-stream` package solves resume after a dropped SSE connection using Redis pub/sub. It assumes the client environment can hold an SSE connection in the first place, which doesn't help when the fetch surface caps you at 15 seconds.
 
 Inngest, Trigger.dev, Defer, and similar workflow engines durably execute long-running jobs. They're full backends with their own opinions, and their clients are built for "render the final result" rather than token-by-token UI streaming.
 
