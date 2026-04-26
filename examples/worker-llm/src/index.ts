@@ -25,6 +25,10 @@ import {
 // confident your streams complete inside a single DO lifetime.
 const DURABLE = true;
 
+interface Env extends WorkerEnv {
+  SECRET?: string;
+}
+
 interface Payload {
   prompt?: string;
   /** Per-token delay in ms (default 250). Set higher to simulate slow LLMs. */
@@ -46,7 +50,7 @@ interface Meta {
 }
 
 export class MyRelay extends RelayBuffer<Payload, Meta> {
-  constructor(state: DurableObjectState, env: WorkerEnv) {
+  constructor(state: DurableObjectState, env: Env) {
     const baseOptions: RelayOptions<Payload, Meta> = {
       streamTtlMs: 30 * 60 * 1000, // keep finished streams 30min for resume
       upstream: async ({ payload, write, heartbeat, signal }) => {
@@ -90,13 +94,12 @@ export class MyRelay extends RelayBuffer<Payload, Meta> {
   }
 }
 
-const handler = createRelayWorker({
+const handler = createRelayWorker<Env>({
   // Bring-your-own-auth. Returning a Response rejects; void allows.
-  auth: (request) => {
+  auth: ({ request, env }) => {
     // Example: require a shared secret header. Replace with HubSpot
-    // install verification, JWT, etc.
-    const expected = (globalThis as { SECRET?: string }).SECRET;
-    if (expected && request.headers.get("x-relay-secret") !== expected) {
+    // install verification, JWT, etc. Worker secrets live on `env`.
+    if (env.SECRET && request.headers.get("x-relay-secret") !== env.SECRET) {
       return new Response("unauthorized", { status: 401 });
     }
   },

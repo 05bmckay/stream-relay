@@ -10,11 +10,13 @@
  * durability wire up `onAppend` / `hydrate` to their store of choice.
  */
 
-import type {
-  PollResponse,
-  StartRequest,
-  StartResponse,
-  StreamStatus,
+import {
+  PROTOCOL_VERSION,
+  type PollResponse,
+  type RelayError,
+  type StartRequest,
+  type StartResponse,
+  type StreamStatus,
 } from "../shared/protocol";
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -68,6 +70,8 @@ export interface RelayOptions<TPayload = unknown, TMeta = unknown> {
   onAppend?: (streamId: string, chunk: string, offset: number) => Promise<void>;
   onComplete?: (streamId: string, final: FinalState<TMeta>) => Promise<void>;
   onError?: (streamId: string, error: string) => Promise<void>;
+  /** Called when in-memory GC removes a terminal stream record. */
+  onGc?: (streamId: string) => Promise<void>;
 
   /**
    * Called when a poll lands for a streamId we don't have in memory. Return
@@ -132,10 +136,14 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
   const ttl = options.streamTtlMs ?? DEFAULT_TTL_MS;
   const genId =
     options.generateId ??
-    (() =>
+    (() => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (globalThis as any).crypto?.randomUUID?.() ??
-      Math.random().toString(36).slice(2) + Date.now().toString(36));
+      const randomUUID = (globalThis as any).crypto?.randomUUID;
+      if (typeof randomUUID !== "function") {
+        throw new Error("crypto.randomUUID is required; provide options.generateId in this runtime");
+      }
+      return randomUUID.call((globalThis as any).crypto);
+    });
 
   function gc() {
     const now = Date.now();
@@ -144,6 +152,11 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
       if (now - rec.lastPolledAt > ttl) {
         if (rec.inactivityTimer) clearTimeout(rec.inactivityTimer);
         streams.delete(id);
+        if (options.onGc) {
+          options
+            .onGc(id)
+            .catch((e) => console.error("[relay] onGc hook failed", e));
+        }
       }
     }
   }
@@ -180,7 +193,7 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
     // Idempotency: re-starting an existing live stream is a no-op.
     const existing = streams.get(streamId);
     if (existing) {
-      return { streamId, startedAt: existing.startedAt };
+      return { protocolVersion: PROTOCOL_VERSION, streamId, startedAt: existing.startedAt };
     }
 
     const now = Date.now();
@@ -202,7 +215,7 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
     // the client is going to start polling regardless.
     void runUpstream(rec, req.payload as TPayload);
 
-    return { streamId, startedAt: now };
+    return { protocolVersion: PROTOCOL_VERSION, streamId, startedAt: now };
   }
 
   async function runUpstream(
@@ -301,16 +314,26 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
 
     const now = Date.now();
     if (!rec) {
+      const errorInfo: RelayError = {
+        code: "stream_not_found",
+        message: `stream ${streamId} not found`,
+      };
       return {
+        protocolVersion: PROTOCOL_VERSION,
+        streamId,
         status: "not_found",
+        done: true,
         append: "",
         nextOffset: 0,
         lastEventAt: 0,
         serverNow: now,
+        error: errorInfo.message,
+        errorInfo,
       };
     }
 
     rec.lastPolledAt = now;
+    gc();
     scheduleInactivityAbort(rec);
 
     const safeSince = Number.isFinite(since)
@@ -318,15 +341,33 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
       : rec.buffer.length;
     const append = rec.buffer.slice(safeSince);
 
+    const errorInfo = rec.status === "error"
+      ? errorInfoFor(rec.error ?? "stream error")
+      : undefined;
+
     return {
+      protocolVersion: PROTOCOL_VERSION,
+      streamId,
       status: rec.status,
+      done: rec.status !== "streaming",
       append,
       nextOffset: rec.buffer.length,
       lastEventAt: rec.lastEventAt,
       serverNow: now,
       final: rec.status === "done" ? rec.final : undefined,
       error: rec.status === "error" ? rec.error : undefined,
+      errorInfo,
     };
+  }
+
+  function errorInfoFor(message: string): RelayError {
+    if (message === "stream aborted after client inactivity") {
+      return { code: "stream_inactive", message };
+    }
+    if (message === "stream was interrupted before completion") {
+      return { code: "stream_interrupted", message };
+    }
+    return { code: "stream_error", message };
   }
 
   return {

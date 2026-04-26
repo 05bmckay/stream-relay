@@ -70,6 +70,18 @@ export function withDurableStorage<TPayload, TMeta>(
   // adapted to DO storage's API.
   const flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const pendingBuffer = new Map<string, string>();
+  const queues = new Map<string, Promise<unknown>>();
+
+  const enqueue = <T>(id: string, fn: () => Promise<T>) => {
+    const next = (queues.get(id) ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(fn);
+    queues.set(id, next);
+    void next.finally(() => {
+      if (queues.get(id) === next) queues.delete(id);
+    });
+    return next;
+  };
 
   const scheduleFlush = (id: string) => {
     if (flushTimers.has(id)) return;
@@ -78,11 +90,11 @@ export function withDurableStorage<TPayload, TMeta>(
       const buffer = pendingBuffer.get(id);
       if (buffer === undefined) return;
       try {
-        await state.storage.put(`relay:${id}`, {
+        await enqueue(id, () => state.storage.put(`relay:${id}`, {
           buffer,
           status: "streaming" as const,
           lastEventAt: Date.now(),
-        });
+        }));
       } catch (err) {
         console.error("[stream-relay] DO flush failed", err);
       }
@@ -98,11 +110,11 @@ export function withDurableStorage<TPayload, TMeta>(
       const next = prior + chunk;
       pendingBuffer.set(id, next);
       if (flushInterval === 0) {
-        await state.storage.put(`relay:${id}`, {
+        await enqueue(id, () => state.storage.put(`relay:${id}`, {
           buffer: next,
           status: "streaming" as const,
           lastEventAt: Date.now(),
-        });
+        }));
       } else {
         scheduleFlush(id);
       }
@@ -117,12 +129,12 @@ export function withDurableStorage<TPayload, TMeta>(
       }
       pendingBuffer.delete(id);
       try {
-        await state.storage.put(`relay:${id}`, {
+        await enqueue(id, () => state.storage.put(`relay:${id}`, {
           buffer: final.text,
           status: "done",
           lastEventAt: Date.now(),
           final,
-        });
+        }));
       } catch (err) {
         console.error("[stream-relay] DO complete write failed", err);
       }
@@ -138,16 +150,21 @@ export function withDurableStorage<TPayload, TMeta>(
       const buffer = pendingBuffer.get(id) ?? "";
       pendingBuffer.delete(id);
       try {
-        await state.storage.put(`relay:${id}`, {
+        await enqueue(id, () => state.storage.put(`relay:${id}`, {
           buffer,
           status: "error",
           lastEventAt: Date.now(),
           error: message,
-        });
+        }));
       } catch (err) {
         console.error("[stream-relay] DO error write failed", err);
       }
       if (options.onError) await options.onError(id, message);
+    },
+
+    onGc: async (id) => {
+      if (options.onGc) await options.onGc(id);
+      await enqueue(id, () => state.storage.delete(`relay:${id}`));
     },
 
     hydrate: async (id) => {
@@ -244,13 +261,20 @@ export interface WorkerEnv {
   RELAY: DurableObjectNamespace;
 }
 
-export interface RelayWorkerOptions {
+export interface RelayWorkerAuthContext<Env = WorkerEnv> {
+  request: Request;
+  env: Env;
+  streamId: string | null;
+  method: "start" | "poll" | "unknown";
+}
+
+export interface RelayWorkerOptions<Env = WorkerEnv> {
   /**
-   * Optional auth check. Receives the incoming request; throw or return a
+   * Optional auth check. Receives parsed routing context; throw or return a
    * Response to reject. Same rationale as the Hono adapter — we don't ship
    * auth, you bring your own.
    */
-  auth?: (request: Request) => Promise<void | Response> | void | Response;
+  auth?: (ctx: RelayWorkerAuthContext<Env>) => Promise<void | Response> | void | Response;
 }
 
 /**
@@ -262,16 +286,22 @@ export interface RelayWorkerOptions {
  * The DO instance is keyed by `streamId`, so all polls for one stream hit
  * the same isolate.
  */
-export function createRelayWorker(options: RelayWorkerOptions = {}) {
+export function createRelayWorker<Env extends WorkerEnv = WorkerEnv>(options: RelayWorkerOptions<Env> = {}) {
   return {
-    async fetch(request: Request, env: WorkerEnv): Promise<Response> {
-      if (options.auth) {
-        const result = await options.auth(request);
-        if (result instanceof Response) return result;
-      }
-
+    async fetch(request: Request, env: Env): Promise<Response> {
       const url = new URL(request.url);
       const segments = url.pathname.split("/").filter(Boolean);
+      const method = request.method === "POST" && segments.length === 1 && segments[0] === "streams"
+        ? "start"
+        : request.method === "GET" && segments.length === 2 && segments[0] === "streams"
+          ? "poll"
+          : "unknown";
+      const routeStreamId = method === "poll" ? segments[1] : null;
+
+      if (options.auth) {
+        const result = await options.auth({ request, env, streamId: routeStreamId, method });
+        if (result instanceof Response) return result;
+      }
 
       // POST /streams
       if (

@@ -19,7 +19,7 @@ import type { RelayOptions, FinalState } from "./index";
 
 export interface KVStore {
   get(key: string): Promise<string | null>;
-  set(key: string, value: string): Promise<void>;
+  set(key: string, value: string, opts?: { ttlSeconds?: number }): Promise<void>;
   delete?(key: string): Promise<void>;
 }
 
@@ -45,6 +45,10 @@ export interface KvStorageOptions {
    * every chunk (most durable, most expensive).
    */
   flushIntervalMs?: number;
+  /** Optional TTL for persisted records, in seconds. Passed to KV adapters that support it. */
+  ttlSeconds?: number;
+  /** Delete persisted terminal records when the core GC evicts them. Default true. */
+  deleteOnGc?: boolean;
 }
 
 /**
@@ -68,6 +72,8 @@ export function withKvStorage<TPayload, TMeta>(
 ): RelayOptions<TPayload, TMeta> {
   const prefix = options.prefix ?? "stream-relay:";
   const flushInterval = options.flushIntervalMs ?? 500;
+  const ttlSeconds = options.ttlSeconds;
+  const deleteOnGc = options.deleteOnGc ?? true;
 
   // Per-stream batched writers. A trailing-edge debounce: chunks within
   // `flushInterval` accumulate, then one write fires. The latest chunk's
@@ -75,8 +81,21 @@ export function withKvStorage<TPayload, TMeta>(
   // a coherent state at some prior offset.
   const flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const pendingState = new Map<string, PersistedState<TMeta>>();
+  const queues = new Map<string, Promise<unknown>>();
 
   const keyFor = (id: string) => `${prefix}${id}`;
+  const enqueue = <T>(id: string, fn: () => Promise<T>) => {
+    const next = (queues.get(id) ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(fn);
+    queues.set(id, next);
+    void next.finally(() => {
+      if (queues.get(id) === next) queues.delete(id);
+    });
+    return next;
+  };
+  const setState = (id: string, state: PersistedState<TMeta>) =>
+    enqueue(id, () => kv.set(keyFor(id), JSON.stringify(state), { ttlSeconds }));
 
   const scheduleFlush = (id: string) => {
     if (flushTimers.has(id)) return;
@@ -85,7 +104,7 @@ export function withKvStorage<TPayload, TMeta>(
       const state = pendingState.get(id);
       if (!state) return;
       try {
-        await kv.set(keyFor(id), JSON.stringify(state));
+        await setState(id, state);
       } catch (err) {
         console.error("[stream-relay] kv flush failed", err);
       }
@@ -106,11 +125,12 @@ export function withKvStorage<TPayload, TMeta>(
       // the full buffer here (it'd be circular), so we accumulate from
       // chunks. `offset` is the new total length, which lets us validate
       // accumulation matches.
-      pendingState.set(id, {
+      const state = {
         ...prior,
         buffer: prior.buffer + _chunk,
         lastEventAt: Date.now(),
-      });
+      };
+      pendingState.set(id, state);
       // Sanity check, mostly for debugging upstreams that emit weird
       // chunks. The relay core itself enforces monotonic offsets.
       const expected = prior.buffer.length + _chunk.length;
@@ -120,7 +140,7 @@ export function withKvStorage<TPayload, TMeta>(
         );
       }
       if (flushInterval === 0) {
-        await kv.set(keyFor(id), JSON.stringify(pendingState.get(id)));
+        await setState(id, state);
       } else {
         scheduleFlush(id);
       }
@@ -144,7 +164,7 @@ export function withKvStorage<TPayload, TMeta>(
         flushTimers.delete(id);
       }
       try {
-        await kv.set(keyFor(id), JSON.stringify(state));
+        await setState(id, state);
       } catch (err) {
         console.error("[stream-relay] kv complete write failed", err);
       }
@@ -165,19 +185,26 @@ export function withKvStorage<TPayload, TMeta>(
         error: message,
         lastEventAt: Date.now(),
       };
-      try {
-        await kv.set(keyFor(id), JSON.stringify(state));
-      } catch (err) {
-        console.error("[stream-relay] kv error write failed", err);
-      }
-      pendingState.delete(id);
       const t = flushTimers.get(id);
       if (t) {
         clearTimeout(t);
         flushTimers.delete(id);
       }
+      try {
+        await setState(id, state);
+      } catch (err) {
+        console.error("[stream-relay] kv error write failed", err);
+      }
+      pendingState.delete(id);
 
       if (options.onError) await options.onError(id, message);
+    },
+
+    onGc: async (id) => {
+      if (options.onGc) await options.onGc(id);
+      if (deleteOnGc && kv.delete) {
+        await enqueue(id, () => kv.delete?.(keyFor(id)) ?? Promise.resolve());
+      }
     },
 
     hydrate: async (id) => {
@@ -215,11 +242,16 @@ export function withKvStorage<TPayload, TMeta>(
  *   createRelayApp(withKvStorage(kv, { upstream: ... }));
  */
 export function kvFromCloudflare(
-  ns: { get(key: string): Promise<string | null>; put(key: string, value: string): Promise<void>; delete(key: string): Promise<void> },
+  ns: {
+    get(key: string): Promise<string | null>;
+    put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>;
+    delete(key: string): Promise<void>;
+  },
 ): KVStore {
   return {
     get: (key) => ns.get(key),
-    set: (key, value) => ns.put(key, value),
+    set: (key, value, opts) =>
+      ns.put(key, value, opts?.ttlSeconds ? { expirationTtl: opts.ttlSeconds } : undefined),
     delete: (key) => ns.delete(key),
   };
 }

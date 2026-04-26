@@ -212,15 +212,15 @@ This package does not ship built-in auth. Every host has different requirements 
 
 ```ts
 createRelayWorker({
-  auth: (request) => {
-    if (!isValidHubSpotInstall(request)) {
+  auth: ({ request, env, streamId, method }) => {
+    if (!isValidHubSpotInstall(request, env, streamId, method)) {
       return new Response("unauthorized", { status: 401 });
     }
   },
 });
 ```
 
-The same `auth` option works on both the Worker and Hono adapters.
+The same `auth` option works on both the Worker and Hono adapters. Worker auth receives `{ request, env, streamId, method }`; Hono auth receives the Hono `Context`.
 
 ## API reference
 
@@ -234,7 +234,7 @@ The same `auth` option works on both the Worker and Hono adapters.
 | `intervalMs` | 400 | Poll cadence |
 | `resumeFrom` | 0 | JavaScript string offset, or `"live"` to skip backlog |
 | `reconnect.serverStallMs` | 90000 | Give-up threshold for silent server |
-| `reconnect.staleResyncMs` | 3000 | Force-resync threshold for client |
+| `reconnect.staleResyncMs` | 3000 | Reconnecting UI hint threshold |
 
 Full JSDoc on every option in [`packages/client/index.ts`](./packages/client/index.ts).
 
@@ -263,8 +263,10 @@ POST /streams          { streamId?, payload? }
                        -> { streamId, startedAt }
 
 GET  /streams/:id?since=N
-                       -> { status, append, nextOffset, lastEventAt, serverNow,
-                            final?: { text, meta? }, error? }
+                       -> { protocolVersion: 1, streamId, status, done,
+                            append, nextOffset, lastEventAt, serverNow,
+                            final?: { text, meta? }, error?,
+                            errorInfo?: { code, message } }
 ```
 
 `status` is one of `streaming`, `done`, `error`, `not_found`. `since` and `nextOffset` are JavaScript string offsets (UTF-16 code units), matching the package's string-in/string-out API. Clients use `serverNow - lastEventAt > serverStallMs` to detect dead streams without trusting their own clock.

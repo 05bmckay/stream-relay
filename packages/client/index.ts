@@ -42,7 +42,7 @@ export interface UseStreamOptions<TMeta = unknown> {
 
   /** Tuning knobs for resilience. See defaults in `DEFAULTS`. */
   reconnect?: {
-    /** Client-side stale threshold → forces `since=0` resync. Default 3000. */
+    /** Client-side stale threshold for reconnecting UI hint. Default 3000. */
     staleResyncMs?: number;
     /** Server-side stall threshold → fires `onError`. Default 90000. */
     serverStallMs?: number;
@@ -121,21 +121,23 @@ export function useStream<TMeta = unknown>(
   const [isStreaming, setIsStreaming] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
   const [offset, setOffset] = useState(0);
+  const [activeStreamId, setActiveStreamId] = useState<string | null>(null);
 
-  // Refs so the loop doesn't restart when callers pass inline handlers.
+  // Refs so the loop doesn't restart when callers pass inline handlers/fetchers.
   const onChunkRef = useRef(options.onChunk);
   const onDoneRef = useRef(options.onDone);
   const onErrorRef = useRef(options.onError);
+  const fetcherRef = useRef(fetcher);
   useEffect(() => {
     onChunkRef.current = options.onChunk;
     onDoneRef.current = options.onDone;
     onErrorRef.current = options.onError;
+    fetcherRef.current = fetcher;
   });
 
   useEffect(() => {
     if (!enabled || !streamId || !proxyUrl) return undefined;
 
-    const fetchImpl = fetcher ?? fetch;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let inFlight: AbortController | null = null;
@@ -147,6 +149,7 @@ export function useStream<TMeta = unknown>(
     let lastAdvanceAt = Date.now();
     let retries = 0;
 
+    setActiveStreamId(streamId);
     setIsStreaming(true);
     setReconnecting(false);
     setOffset(typeof currentOffset === "number" && currentOffset >= 0 ? currentOffset : 0);
@@ -177,18 +180,15 @@ export function useStream<TMeta = unknown>(
 
       // "live" mode: first request asks for since=very-large so we get
       // nextOffset back without any append, then settle there.
-      const stale =
-        currentOffset >= 0 && Date.now() - lastAdvanceAt > staleResyncMs;
       const sinceParam =
         currentOffset < 0
           ? Number.MAX_SAFE_INTEGER
-          : stale
-            ? 0
-            : currentOffset;
+          : currentOffset;
 
       let res: Response;
       try {
         inFlight = new AbortController();
+        const fetchImpl = fetcherRef.current ?? fetch;
         res = await fetchImpl(
           `${proxyUrl}/streams/${encodeURIComponent(streamId)}?since=${sinceParam}`,
           { method: "GET", signal: inFlight.signal },
@@ -227,21 +227,6 @@ export function useStream<TMeta = unknown>(
       if (currentOffset < 0) {
         currentOffset = data.nextOffset;
         setOffset(currentOffset);
-      } else if (stale) {
-        // Resync: server may have string data we missed. Slice from our offset.
-        if (data.nextOffset > currentOffset) {
-          // `append` here is buffer.slice(0); take only what we need.
-          const tail =
-            typeof data.append === "string"
-              ? data.append.slice(currentOffset)
-              : "";
-          currentOffset = data.nextOffset;
-          setOffset(currentOffset);
-          if (tail.length > 0) {
-            lastAdvanceAt = Date.now();
-            onChunkRef.current?.(tail, currentOffset);
-          }
-        }
       } else if (data.append && data.append.length > 0) {
         currentOffset = data.nextOffset;
         setOffset(currentOffset);
@@ -312,13 +297,13 @@ export function useStream<TMeta = unknown>(
       stop("cancel");
       setIsStreaming(false);
       setReconnecting(false);
+      setActiveStreamId((current) => (current === streamId ? null : current));
     };
     // We intentionally exclude the callback refs from deps — they're refs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     proxyUrl,
     streamId,
-    fetcher,
     intervalMs,
     enabled,
     resumeFrom,
@@ -328,5 +313,11 @@ export function useStream<TMeta = unknown>(
     retryBackoffMs,
   ]);
 
-  return { isStreaming, reconnecting, offset };
+  const currentStreamOwnsState = !!streamId && activeStreamId === streamId;
+
+  return {
+    isStreaming: currentStreamOwnsState && isStreaming,
+    reconnecting: currentStreamOwnsState && reconnecting,
+    offset: currentStreamOwnsState ? offset : 0,
+  };
 }

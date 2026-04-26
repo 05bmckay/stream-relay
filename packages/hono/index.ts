@@ -47,7 +47,7 @@ export function createRelayApp<TPayload = unknown, TMeta = unknown>(
       return undefined;
     };
     app.use("/streams", wrap);
-    app.use("/streams/:id", wrap);
+    app.use("/streams/*", wrap);
   }
 
   app.post("/streams", async (c) => {

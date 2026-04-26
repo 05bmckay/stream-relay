@@ -24,6 +24,10 @@
     "dist",
     "README.md"
   ],
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false,
   "exports": {
     "./client": {
       "types": "./dist/client.d.ts",
@@ -56,10 +60,14 @@
     "release:github": "node scripts/release-github.mjs"
   },
   "peerDependencies": {
-    "hono": ">=4",
-    "react": ">=18"
+    "@cloudflare/workers-types": "*",
+    "hono": ">=4 <5",
+    "react": ">=18 <20"
   },
   "peerDependenciesMeta": {
+    "@cloudflare/workers-types": {
+      "optional": true
+    },
     "react": {
       "optional": true
     },

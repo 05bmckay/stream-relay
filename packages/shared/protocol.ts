@@ -11,7 +11,14 @@
  * and lives outside this package.
  */
 
+export const PROTOCOL_VERSION = 1;
+
 export type StreamStatus = "streaming" | "done" | "error" | "not_found";
+
+export interface RelayError {
+  code: "stream_error" | "stream_not_found" | "stream_interrupted" | "stream_inactive";
+  message: string;
+}
 
 export interface StartRequest {
   /**
@@ -32,13 +39,24 @@ export interface StartRequest {
 }
 
 export interface StartResponse {
+  /** Wire protocol version. */
+  protocolVersion: typeof PROTOCOL_VERSION;
   streamId: string;
   /** Server time at start, ms since epoch. Useful for clock-skew debugging. */
   startedAt: number;
 }
 
 export interface PollResponse<TMeta = unknown> {
+  /** Wire protocol version. */
+  protocolVersion: typeof PROTOCOL_VERSION;
+
+  /** Echoes the stream id being polled so clients can discard stale pairs. */
+  streamId: string;
+
   status: StreamStatus;
+
+  /** Convenience terminal flag: true for `done`, `error`, and `not_found`. */
+  done: boolean;
 
   /**
    * New string data appended since the `since` offset the client requested.
@@ -80,6 +98,9 @@ export interface PollResponse<TMeta = unknown> {
 
   /** Populated when `status === "error"`. Human-readable message. */
   error?: string;
+
+  /** Structured error for protocol-aware clients. */
+  errorInfo?: RelayError;
 }
 
 /**
