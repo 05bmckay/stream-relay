@@ -237,7 +237,7 @@ export function withKvStorage<TPayload, TMeta>(
  * shape this module expects. Use this when wiring withKvStorage in a
  * Worker that uses the Hono adapter (or the relay core directly).
  *
- *   import { kvFromCloudflare } from "stream-relay/server";
+ *   import { kvFromCloudflare } from "@hs-uix/stream-relay/server";
  *   const kv = kvFromCloudflare(env.MY_KV);
  *   createRelayApp(withKvStorage(kv, { upstream: ... }));
  */

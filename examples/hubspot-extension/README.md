@@ -65,13 +65,13 @@ repository, change the card dependency from the local file reference to the npm
 package:
 
 ```json
-"stream-relay": "latest"
+"@hs-uix/stream-relay": "beta"
 ```
 
 or run:
 
 ```sh
-npm install stream-relay react @hubspot/ui-extensions
+npm install @hs-uix/stream-relay react @hubspot/ui-extensions
 ```
 
 ## Develop and deploy

@@ -28,7 +28,7 @@ The relay buffers upstream output in memory. The client polls `GET /streams/:id?
 ## Install
 
 ```sh
-npm install stream-relay
+npm install @hs-uix/stream-relay
 ```
 
 One package, four entry points. Bundlers only pull in what you import.
@@ -38,7 +38,7 @@ One package, four entry points. Bundlers only pull in what you import.
 ### Client: React
 
 ```tsx
-import { useStream } from "stream-relay/client";
+import { useStream } from "@hs-uix/stream-relay/client";
 import { useState } from "react";
 
 function MyCard() {
@@ -85,7 +85,7 @@ A complete HubSpot CRM card example with serverless-function-backed property per
 
 ```ts
 // worker.ts
-import { RelayBuffer, createRelayWorker } from "stream-relay/worker";
+import { RelayBuffer, createRelayWorker } from "@hs-uix/stream-relay/worker";
 
 export class MyRelay extends RelayBuffer {
   constructor(state, env) {
@@ -118,7 +118,7 @@ new_classes = ["MyRelay"]
 ### Server: Node, Bun, or Deno via Hono
 
 ```ts
-import { createRelayApp } from "stream-relay/hono";
+import { createRelayApp } from "@hs-uix/stream-relay/hono";
 import { serve } from "@hono/node-server";
 
 const { app } = createRelayApp({
@@ -171,7 +171,7 @@ Default behavior is in-memory. If the server restarts, in-flight streams die wit
 ### Cloudflare: Durable Object storage
 
 ```ts
-import { RelayBuffer, withDurableStorage } from "stream-relay/worker";
+import { RelayBuffer, withDurableStorage } from "@hs-uix/stream-relay/worker";
 
 export class MyRelay extends RelayBuffer {
   constructor(state, env) {
@@ -187,7 +187,7 @@ Every chunk is debounced into the DO's storage. On rehydrate (eviction, deploy, 
 ### Hono / Node / anywhere: KV interface
 
 ```ts
-import { createRelayApp, withKvStorage } from "stream-relay/hono";
+import { createRelayApp, withKvStorage } from "@hs-uix/stream-relay/hono";
 
 const myKv = {
   get: (k) => redis.get(k),
@@ -224,7 +224,7 @@ The same `auth` option works on both the Worker and Hono adapters. Worker auth r
 
 ## API reference
 
-### `useStream(options)` from `stream-relay/client`
+### `useStream(options)` from `@hs-uix/stream-relay/client`
 
 | Option | Default | Purpose |
 |---|---|---|
@@ -238,19 +238,19 @@ The same `auth` option works on both the Worker and Hono adapters. Worker auth r
 
 Full JSDoc on every option in [`packages/client/index.ts`](./packages/client/index.ts).
 
-### `createRelay(options)` from `stream-relay/server`
+### `createRelay(options)` from `@hs-uix/stream-relay/server`
 
 Framework-agnostic core if you're rolling your own HTTP layer. Returns `{ handleStart, handlePoll }` as pure async functions. `streamTtlMs` controls both finished-buffer retention and inactivity aborts for still-running streams.
 
-### `createRelayApp(options)` from `stream-relay/hono`
+### `createRelayApp(options)` from `@hs-uix/stream-relay/hono`
 
 Hono app with `POST /streams` and `GET /streams/:id` mounted. Runs on Node, Bun, Deno, Vercel, AWS Lambda, or Cloudflare Pages.
 
-### `RelayBuffer`, `createRelayWorker()`, `withDurableStorage()` from `stream-relay/worker`
+### `RelayBuffer`, `createRelayWorker()`, `withDurableStorage()` from `@hs-uix/stream-relay/worker`
 
 Cloudflare Workers + Durable Object. Subclass `RelayBuffer` to wire your upstream; `createRelayWorker()` returns the routing `fetch` handler; `withDurableStorage()` opts into DO-backed durability.
 
-### `withKvStorage(kv, options)` from `stream-relay/server`
+### `withKvStorage(kv, options)` from `@hs-uix/stream-relay/server`
 
 Persistence helper for any KV-shaped store. Accepts `{ get, set, delete? }`. Use directly with `createRelay` or wrap a Hono app's options.
 

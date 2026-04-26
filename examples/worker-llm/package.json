@@ -8,7 +8,7 @@
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "stream-relay": "file:../.."
+    "@hs-uix/stream-relay": "file:../.."
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240909.0",

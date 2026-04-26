@@ -16,7 +16,7 @@ import {
   withDurableStorage,
   type WorkerEnv,
   type RelayOptions,
-} from "stream-relay/worker";
+} from "@hs-uix/stream-relay/worker";
 
 // Long streams (multi-minute LLM calls, agent runs) almost always want
 // this on: it makes every stream survive DO eviction, Workers deploys,

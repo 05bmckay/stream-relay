@@ -11,7 +11,7 @@ import {
   Tile,
   hubspot,
 } from "@hubspot/ui-extensions";
-import { StreamNotFoundError, useStream } from "stream-relay/client";
+import { StreamNotFoundError, useStream } from "@hs-uix/stream-relay/client";
 
 const RELAY_URL = "https://your-relay.workers.dev";
 
