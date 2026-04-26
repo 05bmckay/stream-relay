@@ -1,5 +1,7 @@
 # stream-relay
 
+[![npm beta](https://img.shields.io/npm/v/@hs-uix/stream-relay/beta?label=npm%20beta)](https://www.npmjs.com/package/@hs-uix/stream-relay)
+
 Resumable, pollable stream proxy for clients that can't hold long connections.
 
 If your frontend lives somewhere with a short fetch ceiling (HubSpot UI extensions, sandboxed iframes, embedded SaaS surfaces) and your backend takes longer than that ceiling allows (LLM calls, agent runs, slow APIs), this package sits between them. The client polls a small endpoint at 400ms; the server buffers the upstream response in memory; reloads pick up exactly where they left off.
@@ -27,8 +29,10 @@ The relay buffers upstream output in memory. The client polls `GET /streams/:id?
 
 ## Install
 
+Published on npm as [`@hs-uix/stream-relay`](https://www.npmjs.com/package/@hs-uix/stream-relay). The current release is under the `beta` dist-tag:
+
 ```sh
-npm install @hs-uix/stream-relay
+npm install @hs-uix/stream-relay@beta
 ```
 
 One package, four entry points. Bundlers only pull in what you import.
