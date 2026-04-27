@@ -1,6 +1,6 @@
 # stream-relay
 
-[![npm beta](https://img.shields.io/npm/v/@hs-uix/stream-relay/beta?label=npm%20beta)](https://www.npmjs.com/package/@hs-uix/stream-relay)
+[![npm](https://img.shields.io/npm/v/@hs-uix/stream-relay)](https://www.npmjs.com/package/@hs-uix/stream-relay)
 
 Resumable, pollable stream proxy for clients that can't hold long connections.
 
@@ -29,10 +29,10 @@ The relay buffers upstream output in memory. The client polls `GET /streams/:id?
 
 ## Install
 
-Published on npm as [`@hs-uix/stream-relay`](https://www.npmjs.com/package/@hs-uix/stream-relay). The current release is under the `beta` dist-tag:
+Published on npm as [`@hs-uix/stream-relay`](https://www.npmjs.com/package/@hs-uix/stream-relay):
 
 ```sh
-npm install @hs-uix/stream-relay@beta
+npm install @hs-uix/stream-relay
 ```
 
 One package, four entry points. Bundlers only pull in what you import.
