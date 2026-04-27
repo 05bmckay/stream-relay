@@ -255,7 +255,7 @@ export function useStream<TMeta = unknown>(
         setReconnecting(false);
       }
 
-      if (data.status === "done") {
+      if (data.status === "complete") {
         stop("done");
         onDoneRef.current?.({
           text: data.final?.text ?? "",

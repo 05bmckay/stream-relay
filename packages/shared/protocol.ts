@@ -13,7 +13,7 @@
 
 export const PROTOCOL_VERSION = 1;
 
-export type StreamStatus = "streaming" | "done" | "error" | "not_found";
+export type StreamStatus = "streaming" | "complete" | "error" | "not_found";
 
 export interface RelayError {
   code: "stream_error" | "stream_not_found" | "stream_interrupted" | "stream_inactive";
@@ -55,8 +55,11 @@ export interface PollResponse<TMeta = unknown> {
 
   status: StreamStatus;
 
-  /** Convenience terminal flag: true for `done`, `error`, and `not_found`. */
-  done: boolean;
+  /** True once the upstream resolved successfully. */
+  complete: boolean;
+
+  /** Server time when the upstream completed successfully, ms since epoch. */
+  completed_at?: number;
 
   /**
    * New string data appended since the `since` offset the client requested.
@@ -88,7 +91,7 @@ export interface PollResponse<TMeta = unknown> {
   serverNow: number;
 
   /**
-   * Populated when `status === "done"`. The full final buffer plus whatever
+   * Populated when `status === "complete"`. The full final buffer plus whatever
    * structured metadata the host app attached on completion.
    */
   final?: {

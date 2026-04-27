@@ -26,7 +26,7 @@ import {
 /**
  * Function the host app provides to actually run the upstream work. Receives
  * the `payload` from `StartRequest` and a `writer` to push string data back
- * into the relay buffer. Resolve to mark `done`; throw to mark `error`.
+ * into the relay buffer. Resolve to mark `complete`; throw to mark `error`.
  *
  * The writer is intentionally string-oriented (string in, string out). Hosts
  * doing structured streaming (JSON events, SSE frames) should serialize on
@@ -98,6 +98,7 @@ export interface HydratedState<TMeta = unknown> {
   lastEventAt: number;
   final?: FinalState<TMeta>;
   error?: string;
+  completed_at?: number;
 }
 
 export interface Relay {
@@ -123,6 +124,7 @@ interface StreamRecord<TMeta = unknown> {
   startedAt: number;
   final?: FinalState<TMeta>;
   error?: string;
+  completed_at?: number;
   abort: AbortController;
   inactivityTimer?: ReturnType<typeof setTimeout>;
 }
@@ -252,9 +254,11 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
         text: rec.buffer,
         meta: meta ?? undefined,
       };
-      rec.status = "done";
+      const completedAt = Date.now();
+      rec.status = "complete";
       rec.final = final;
-      rec.lastEventAt = Date.now();
+      rec.completed_at = completedAt;
+      rec.lastEventAt = completedAt;
       if (options.onComplete) {
         options
           .onComplete(rec.streamId, final)
@@ -298,6 +302,7 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
           lastPolledAt: now,
           startedAt: now,
           final: hydrated.final,
+          completed_at: hydrated.completed_at,
           error: interrupted
             ? "stream was interrupted before completion"
             : hydrated.error,
@@ -322,7 +327,7 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
         protocolVersion: PROTOCOL_VERSION,
         streamId,
         status: "not_found",
-        done: true,
+        complete: false,
         append: "",
         nextOffset: 0,
         lastEventAt: 0,
@@ -349,12 +354,13 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
       protocolVersion: PROTOCOL_VERSION,
       streamId,
       status: rec.status,
-      done: rec.status !== "streaming",
+      complete: rec.status === "complete",
+      completed_at: rec.completed_at,
       append,
       nextOffset: rec.buffer.length,
       lastEventAt: rec.lastEventAt,
       serverNow: now,
-      final: rec.status === "done" ? rec.final : undefined,
+      final: rec.status === "complete" ? rec.final : undefined,
       error: rec.status === "error" ? rec.error : undefined,
       errorInfo,
     };

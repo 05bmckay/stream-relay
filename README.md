@@ -264,16 +264,16 @@ The contract is small enough to reimplement in any language:
 
 ```
 POST /streams          { streamId?, payload? }
-                       -> { streamId, startedAt }
+                       -> { protocolVersion: 1, streamId, startedAt }
 
 GET  /streams/:id?since=N
-                       -> { protocolVersion: 1, streamId, status, done,
-                            append, nextOffset, lastEventAt, serverNow,
-                            final?: { text, meta? }, error?,
+                       -> { protocolVersion: 1, streamId, status, complete,
+                            completed_at?, append, nextOffset, lastEventAt,
+                            serverNow, final?: { text, meta? }, error?,
                             errorInfo?: { code, message } }
 ```
 
-`status` is one of `streaming`, `done`, `error`, `not_found`. `since` and `nextOffset` are JavaScript string offsets (UTF-16 code units), matching the package's string-in/string-out API. Clients use `serverNow - lastEventAt > serverStallMs` to detect dead streams without trusting their own clock.
+`status` is one of `streaming`, `complete`, `error`, `not_found`. `complete` is `true` only after the upstream resolves successfully; `completed_at` is populated at that point with server time in ms since epoch. `since` and `nextOffset` are JavaScript string offsets (UTF-16 code units), matching the package's string-in/string-out API. Clients use `serverNow - lastEventAt > serverStallMs` to detect dead streams without trusting their own clock.
 
 ## What we tested
 
@@ -285,7 +285,7 @@ Direct calls into `handleStart` and `handlePoll`, no HTTP. Covers happy-path str
 
 ### Hono integration tests over real HTTP
 
-A real `@hono/node-server` on a random port, real `fetch` calls. Validates: end-to-end POST plus poll loop until done with byte-perfect accumulated content, `not_found` returned for unknown stream id, mid-stream disconnect-then-resume yielding zero gaps and zero overlap, three concurrent clients on the same stream observing identical content, and idempotent start where the second POST reuses the existing stream rather than restarting the upstream.
+A real `@hono/node-server` on a random port, real `fetch` calls. Validates: end-to-end POST plus poll loop until complete with byte-perfect accumulated content, `not_found` returned for unknown stream id, mid-stream disconnect-then-resume yielding zero gaps and zero overlap, three concurrent clients on the same stream observing identical content, and idempotent start where the second POST reuses the existing stream rather than restarting the upstream.
 
 ### Stress tests
 

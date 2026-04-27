@@ -25,9 +25,10 @@ export interface KVStore {
 
 interface PersistedState<TMeta> {
   buffer: string;
-  status: "streaming" | "done" | "error";
+  status: "streaming" | "complete" | "error";
   lastEventAt: number;
   final?: FinalState<TMeta>;
+  completed_at?: number;
   error?: string;
 }
 
@@ -152,9 +153,10 @@ export function withKvStorage<TPayload, TMeta>(
     onComplete: async (id, final) => {
       const state: PersistedState<TMeta> = {
         buffer: final.text,
-        status: "done",
+        status: "complete",
         lastEventAt: Date.now(),
         final,
+        completed_at: Date.now(),
       };
       pendingState.set(id, state);
       // Cancel any pending debounce; write final state immediately.
@@ -222,6 +224,7 @@ export function withKvStorage<TPayload, TMeta>(
           status: parsed.status,
           lastEventAt: parsed.lastEventAt,
           final: parsed.final,
+          completed_at: parsed.completed_at,
           error: parsed.error,
         };
       } catch (err) {

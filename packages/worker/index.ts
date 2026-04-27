@@ -131,9 +131,10 @@ export function withDurableStorage<TPayload, TMeta>(
       try {
         await enqueue(id, () => state.storage.put(`relay:${id}`, {
           buffer: final.text,
-          status: "done",
+          status: "complete",
           lastEventAt: Date.now(),
           final,
+          completed_at: Date.now(),
         }));
       } catch (err) {
         console.error("[stream-relay] DO complete write failed", err);
@@ -175,9 +176,10 @@ export function withDurableStorage<TPayload, TMeta>(
       try {
         const saved = await state.storage.get<{
           buffer: string;
-          status: "streaming" | "done" | "error";
+          status: "streaming" | "complete" | "error";
           lastEventAt: number;
           final?: FinalState<TMeta>;
+          completed_at?: number;
           error?: string;
         }>(`relay:${id}`);
         if (!saved) return null;
@@ -186,6 +188,7 @@ export function withDurableStorage<TPayload, TMeta>(
           status: saved.status,
           lastEventAt: saved.lastEventAt,
           final: saved.final,
+          completed_at: saved.completed_at,
           error: saved.error,
         };
       } catch (err) {
