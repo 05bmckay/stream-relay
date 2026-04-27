@@ -1,6 +1,6 @@
 {
   "name": "@hs-uix/stream-relay",
-  "version": "0.1.0-beta.1",
+  "version": "0.1.0",
   "description": "Resumable, pollable stream proxy for environments where the client can't hold long connections (HubSpot UI extensions, iframe sandboxes, serverless edges).",
   "license": "MIT",
   "author": "Carter McKay",
