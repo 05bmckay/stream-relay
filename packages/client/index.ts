@@ -2,22 +2,21 @@
  * React hook for consuming a relay stream.
  *
  * Polls the relay's `GET /streams/:id` endpoint at a fixed cadence, delivers
- * new string data via `onChunk`, and surfaces lifecycle via `onDone` / `onError`.
+ * new string data via `onChunk`, app progress via `onProgress`, and surfaces
+ * lifecycle via `onDone` / `onError`.
  *
- * The hook is deliberately string-oriented: the relay shuttles strings, and
- * the caller decides how to interpret them (plain text, markdown, NDJSON,
- * a custom event format). Anything richer than that belongs in a wrapper
- * hook, not here.
+ * The hook keeps output string-oriented while exposing a small side-channel
+ * for app-level progress messages.
  */
 
 import { useEffect, useRef, useState } from "react";
-import type { PollResponse } from "../shared/protocol";
+import type { PollResponse, ProgressState } from "../shared/protocol";
 
 // ─────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────
 
-export interface UseStreamOptions<TMeta = unknown> {
+export interface UseStreamOptions<TMeta = unknown, TProgressData = unknown> {
   /** Base URL of your deployed relay (no trailing slash). */
   proxyUrl: string;
 
@@ -61,15 +60,18 @@ export interface UseStreamOptions<TMeta = unknown> {
   resumeFrom?: number | "live";
 
   onChunk?: (append: string, nextOffset: number) => void;
+  onProgress?: (progress: ProgressState<TProgressData>) => void;
   onDone?: (final: { text: string; meta?: TMeta }) => void;
   onError?: (error: Error) => void;
 }
 
-export interface UseStreamResult {
+export interface UseStreamResult<TProgressData = unknown> {
   isStreaming: boolean;
   reconnecting: boolean;
   /** Persist alongside `streamId` to enable cross-reload resume. */
   offset: number;
+  /** Latest app-level progress update emitted by the upstream. */
+  progress?: ProgressState<TProgressData>;
 }
 
 const DEFAULTS = {
@@ -99,9 +101,9 @@ export class StreamStalledError extends Error {
 // Hook
 // ─────────────────────────────────────────────────────────────────────────
 
-export function useStream<TMeta = unknown>(
-  options: UseStreamOptions<TMeta>,
-): UseStreamResult {
+export function useStream<TMeta = unknown, TProgressData = unknown>(
+  options: UseStreamOptions<TMeta, TProgressData>,
+): UseStreamResult<TProgressData> {
   const {
     proxyUrl,
     streamId,
@@ -121,15 +123,18 @@ export function useStream<TMeta = unknown>(
   const [isStreaming, setIsStreaming] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
   const [offset, setOffset] = useState(0);
+  const [progress, setProgress] = useState<ProgressState<TProgressData> | undefined>();
   const [activeStreamId, setActiveStreamId] = useState<string | null>(null);
 
   // Refs so the loop doesn't restart when callers pass inline handlers/fetchers.
   const onChunkRef = useRef(options.onChunk);
+  const onProgressRef = useRef(options.onProgress);
   const onDoneRef = useRef(options.onDone);
   const onErrorRef = useRef(options.onError);
   const fetcherRef = useRef(fetcher);
   useEffect(() => {
     onChunkRef.current = options.onChunk;
+    onProgressRef.current = options.onProgress;
     onDoneRef.current = options.onDone;
     onErrorRef.current = options.onError;
     fetcherRef.current = fetcher;
@@ -147,11 +152,13 @@ export function useStream<TMeta = unknown>(
     //   number → resume from there.
     let currentOffset = resumeFrom === "live" ? -1 : resumeFrom;
     let lastAdvanceAt = Date.now();
+    let lastProgressUpdatedAt = 0;
     let retries = 0;
 
     setActiveStreamId(streamId);
     setIsStreaming(true);
     setReconnecting(false);
+    setProgress(undefined);
     setOffset(typeof currentOffset === "number" && currentOffset >= 0 ? currentOffset : 0);
 
     const sleep = (ms: number) =>
@@ -208,9 +215,9 @@ export function useStream<TMeta = unknown>(
         );
       }
 
-      let data: PollResponse<TMeta>;
+      let data: PollResponse<TMeta, TProgressData>;
       try {
-        data = (await res.json()) as PollResponse<TMeta>;
+        data = (await res.json()) as PollResponse<TMeta, TProgressData>;
       } catch (err) {
         return handleTransientError(err);
       }
@@ -221,6 +228,12 @@ export function useStream<TMeta = unknown>(
       if (data.status === "not_found") {
         fail(new StreamNotFoundError(streamId));
         return { done: true, nextDelay: 0 };
+      }
+
+      if (data.progress && data.progress.updated_at !== lastProgressUpdatedAt) {
+        lastProgressUpdatedAt = data.progress.updated_at;
+        setProgress(data.progress);
+        onProgressRef.current?.(data.progress);
       }
 
       // Normalize "live" mode after first response.
@@ -297,6 +310,7 @@ export function useStream<TMeta = unknown>(
       stop("cancel");
       setIsStreaming(false);
       setReconnecting(false);
+      setProgress(undefined);
       setActiveStreamId((current) => (current === streamId ? null : current));
     };
     // We intentionally exclude the callback refs from deps — they're refs.
@@ -319,5 +333,6 @@ export function useStream<TMeta = unknown>(
     isStreaming: currentStreamOwnsState && isStreaming,
     reconnecting: currentStreamOwnsState && reconnecting,
     offset: currentStreamOwnsState ? offset : 0,
+    progress: currentStreamOwnsState ? progress : undefined,
   };
 }

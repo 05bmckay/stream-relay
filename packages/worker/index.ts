@@ -12,7 +12,7 @@
  * stream is guaranteed to land on the same instance.
  */
 
-import { createRelay, type RelayOptions, type Relay, type FinalState } from "../server";
+import { createRelay, type RelayOptions, type Relay, type FinalState, type ProgressState } from "../server";
 import type { StartRequest } from "../shared/protocol";
 
 // Re-exported so users can construct option types without importing from
@@ -24,6 +24,7 @@ export type {
   UpstreamContext,
   FinalState,
   HydratedState,
+  ProgressState,
   KVStore,
   KvStorageOptions,
 } from "../server";
@@ -70,6 +71,7 @@ export function withDurableStorage<TPayload, TMeta>(
   // adapted to DO storage's API.
   const flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const pendingBuffer = new Map<string, string>();
+  const pendingProgress = new Map<string, ProgressState>();
   const queues = new Map<string, Promise<unknown>>();
 
   const enqueue = <T>(id: string, fn: () => Promise<T>) => {
@@ -94,6 +96,7 @@ export function withDurableStorage<TPayload, TMeta>(
           buffer,
           status: "streaming" as const,
           lastEventAt: Date.now(),
+          progress: pendingProgress.get(id),
         }));
       } catch (err) {
         console.error("[stream-relay] DO flush failed", err);
@@ -114,11 +117,29 @@ export function withDurableStorage<TPayload, TMeta>(
           buffer: next,
           status: "streaming" as const,
           lastEventAt: Date.now(),
+          progress: pendingProgress.get(id),
         }));
       } else {
         scheduleFlush(id);
       }
       if (options.onAppend) await options.onAppend(id, chunk, offset);
+    },
+
+    onProgress: async (id, progress) => {
+      pendingProgress.set(id, progress);
+      const buffer = pendingBuffer.get(id) ?? "";
+      pendingBuffer.set(id, buffer);
+      if (flushInterval === 0) {
+        await enqueue(id, () => state.storage.put(`relay:${id}`, {
+          buffer,
+          status: "streaming" as const,
+          lastEventAt: progress.updated_at,
+          progress,
+        }));
+      } else {
+        scheduleFlush(id);
+      }
+      if (options.onProgress) await options.onProgress(id, progress);
     },
 
     onComplete: async (id, final) => {
@@ -127,14 +148,18 @@ export function withDurableStorage<TPayload, TMeta>(
         clearTimeout(t);
         flushTimers.delete(id);
       }
+      const progress = pendingProgress.get(id);
       pendingBuffer.delete(id);
+      pendingProgress.delete(id);
       try {
+        const completedAt = Date.now();
         await enqueue(id, () => state.storage.put(`relay:${id}`, {
           buffer: final.text,
           status: "complete",
-          lastEventAt: Date.now(),
+          lastEventAt: completedAt,
           final,
-          completed_at: Date.now(),
+          completed_at: completedAt,
+          progress,
         }));
       } catch (err) {
         console.error("[stream-relay] DO complete write failed", err);
@@ -149,13 +174,16 @@ export function withDurableStorage<TPayload, TMeta>(
         flushTimers.delete(id);
       }
       const buffer = pendingBuffer.get(id) ?? "";
+      const progress = pendingProgress.get(id);
       pendingBuffer.delete(id);
+      pendingProgress.delete(id);
       try {
         await enqueue(id, () => state.storage.put(`relay:${id}`, {
           buffer,
           status: "error",
           lastEventAt: Date.now(),
           error: message,
+          progress,
         }));
       } catch (err) {
         console.error("[stream-relay] DO error write failed", err);
@@ -180,6 +208,7 @@ export function withDurableStorage<TPayload, TMeta>(
           lastEventAt: number;
           final?: FinalState<TMeta>;
           completed_at?: number;
+          progress?: ProgressState;
           error?: string;
         }>(`relay:${id}`);
         if (!saved) return null;
@@ -189,6 +218,7 @@ export function withDurableStorage<TPayload, TMeta>(
           lastEventAt: saved.lastEventAt,
           final: saved.final,
           completed_at: saved.completed_at,
+          progress: saved.progress,
           error: saved.error,
         };
       } catch (err) {

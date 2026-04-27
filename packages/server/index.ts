@@ -13,6 +13,7 @@
 import {
   PROTOCOL_VERSION,
   type PollResponse,
+  type ProgressState,
   type RelayError,
   type StartRequest,
   type StartResponse,
@@ -47,6 +48,11 @@ export interface UpstreamContext<TPayload = unknown, TMeta = unknown> {
    * happy without polluting the visible buffer.
    */
   heartbeat: () => void;
+  /**
+   * Publish app-level progress without appending to the visible text buffer.
+   * Use for messages like "Searching CRM..." or "Calling tool...".
+   */
+  progress: (update: string | Omit<ProgressState, "updated_at">) => void;
   /** Aborted when no client has polled in `streamTtlMs`. */
   signal: AbortSignal;
 }
@@ -70,6 +76,7 @@ export interface RelayOptions<TPayload = unknown, TMeta = unknown> {
   onAppend?: (streamId: string, chunk: string, offset: number) => Promise<void>;
   onComplete?: (streamId: string, final: FinalState<TMeta>) => Promise<void>;
   onError?: (streamId: string, error: string) => Promise<void>;
+  onProgress?: (streamId: string, progress: ProgressState) => Promise<void>;
   /** Called when in-memory GC removes a terminal stream record. */
   onGc?: (streamId: string) => Promise<void>;
 
@@ -99,6 +106,7 @@ export interface HydratedState<TMeta = unknown> {
   final?: FinalState<TMeta>;
   error?: string;
   completed_at?: number;
+  progress?: ProgressState;
 }
 
 export interface Relay {
@@ -125,6 +133,7 @@ interface StreamRecord<TMeta = unknown> {
   final?: FinalState<TMeta>;
   error?: string;
   completed_at?: number;
+  progress?: ProgressState;
   abort: AbortController;
   inactivityTimer?: ReturnType<typeof setTimeout>;
 }
@@ -240,6 +249,18 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
       heartbeat: () => {
         rec.lastEventAt = Date.now();
       },
+      progress: (update) => {
+        if (rec.status !== "streaming") return;
+        const now = Date.now();
+        const progress = normalizeProgress(update, now);
+        rec.progress = progress;
+        rec.lastEventAt = now;
+        if (options.onProgress) {
+          options
+            .onProgress(rec.streamId, progress)
+            .catch((err) => console.error("[relay] onProgress failed", err));
+        }
+      },
       signal: rec.abort.signal,
     };
 
@@ -303,6 +324,7 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
           startedAt: now,
           final: hydrated.final,
           completed_at: hydrated.completed_at,
+          progress: hydrated.progress,
           error: interrupted
             ? "stream was interrupted before completion"
             : hydrated.error,
@@ -356,6 +378,7 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
       status: rec.status,
       complete: rec.status === "complete",
       completed_at: rec.completed_at,
+      progress: rec.progress,
       append,
       nextOffset: rec.buffer.length,
       lastEventAt: rec.lastEventAt,
@@ -364,6 +387,15 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
       error: rec.status === "error" ? rec.error : undefined,
       errorInfo,
     };
+  }
+
+  function normalizeProgress(
+    update: string | Omit<ProgressState, "updated_at">,
+    updated_at: number,
+  ): ProgressState {
+    return typeof update === "string"
+      ? { message: update, updated_at }
+      : { ...update, updated_at };
   }
 
   function errorInfoFor(message: string): RelayError {
@@ -384,6 +416,6 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
 }
 
 export type { StreamRecord };
-export type { PollResponse, StartRequest, StartResponse, StreamStatus } from "../shared/protocol";
+export type { PollResponse, ProgressState, StartRequest, StartResponse, StreamStatus } from "../shared/protocol";
 export { withKvStorage, kvFromCloudflare } from "./storage";
 export type { KVStore, KvStorageOptions } from "./storage";

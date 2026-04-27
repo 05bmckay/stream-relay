@@ -168,6 +168,38 @@ If the relay garbage-collected the buffer before you came back, `onError` fires 
 
 If nobody polls a still-running stream for `streamTtlMs` (10 minutes by default), the relay aborts the upstream via `ctx.signal` and marks the stream as `error`. Upstream handlers should pass `signal` into fetch/SDK calls when possible or check `signal.aborted` in long loops.
 
+## Progress updates
+
+Keep protocol lifecycle separate from app-level progress. `status` stays one of `streaming`, `complete`, `error`, or `not_found`; your upstream can publish custom progress through `progress()` without appending anything to the visible text buffer:
+
+```ts
+upstream: async ({ payload, write, progress }) => {
+  progress({ phase: "retrieval", message: "Searching CRM records..." });
+  const records = await searchCrm(payload.contactId);
+
+  progress({
+    phase: "generation",
+    message: "Generating summary...",
+    data: { recordsFound: records.length },
+  });
+
+  for await (const token of callYourLLM(records)) {
+    write(token);
+  }
+}
+```
+
+The latest progress update is returned on polls and surfaced by the React hook:
+
+```tsx
+const { progress } = useStream({
+  streamId,
+  onProgress: ({ message }) => setStatus(message ?? "Working..."),
+});
+```
+
+Progress is also persisted by the bundled KV and Durable Object storage helpers, so reloads can restore the latest known phase/message alongside the text offset.
+
 ## Persistence (optional)
 
 Default behavior is in-memory. If the server restarts, in-flight streams die with it. For most uses (single-region edge deploy, LLM proxying) this is fine. When you need completed stream output to survive deploys, evictions, or multi-day resume windows, opt into one of the bundled persistence helpers.
@@ -208,7 +240,7 @@ const { app } = createRelayApp(withKvStorage(myKv, {
 
 ### Roll your own
 
-The persistence helpers are thin wrappers over four optional callbacks on `RelayOptions`. If you want different semantics (chunked storage, compression, multi-tenant key prefixing), wire `onAppend`, `onComplete`, `onError`, and `hydrate` directly. The relay core never reaches into storage.
+The persistence helpers are thin wrappers over optional callbacks on `RelayOptions`. If you want different semantics (chunked storage, compression, multi-tenant key prefixing), wire `onAppend`, `onProgress`, `onComplete`, `onError`, and `hydrate` directly. The relay core never reaches into storage.
 
 ## Auth
 
@@ -239,6 +271,7 @@ The same `auth` option works on both the Worker and Hono adapters. Worker auth r
 | `resumeFrom` | 0 | JavaScript string offset, or `"live"` to skip backlog |
 | `reconnect.serverStallMs` | 90000 | Give-up threshold for silent server |
 | `reconnect.staleResyncMs` | 3000 | Reconnecting UI hint threshold |
+| `onProgress` | optional | Receives latest app-level progress updates |
 
 Full JSDoc on every option in [`packages/client/index.ts`](./packages/client/index.ts).
 
@@ -268,12 +301,13 @@ POST /streams          { streamId?, payload? }
 
 GET  /streams/:id?since=N
                        -> { protocolVersion: 1, streamId, status, complete,
-                            completed_at?, append, nextOffset, lastEventAt,
-                            serverNow, final?: { text, meta? }, error?,
+                            completed_at?, progress?, append, nextOffset,
+                            lastEventAt, serverNow,
+                            final?: { text, meta? }, error?,
                             errorInfo?: { code, message } }
 ```
 
-`status` is one of `streaming`, `complete`, `error`, `not_found`. `complete` is `true` only after the upstream resolves successfully; `completed_at` is populated at that point with server time in ms since epoch. `since` and `nextOffset` are JavaScript string offsets (UTF-16 code units), matching the package's string-in/string-out API. Clients use `serverNow - lastEventAt > serverStallMs` to detect dead streams without trusting their own clock.
+`status` is one of `streaming`, `complete`, `error`, `not_found`. `complete` is `true` only after the upstream resolves successfully; `completed_at` is populated at that point with server time in ms since epoch. `progress` is the latest app-level progress update, shaped as `{ phase?, message?, data?, updated_at }`. `since` and `nextOffset` are JavaScript string offsets (UTF-16 code units), matching the package's string-in/string-out API. Clients use `serverNow - lastEventAt > serverStallMs` to detect dead streams without trusting their own clock.
 
 ## What we tested
 

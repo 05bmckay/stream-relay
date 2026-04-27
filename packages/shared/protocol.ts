@@ -20,6 +20,17 @@ export interface RelayError {
   message: string;
 }
 
+export interface ProgressState<TData = unknown> {
+  /** Short machine-readable phase, e.g. "retrieval", "tool_call", "generation". */
+  phase?: string;
+  /** Human-readable progress message for UI. */
+  message?: string;
+  /** Optional host-defined progress payload. */
+  data?: TData;
+  /** Server time when progress was last updated, ms since epoch. */
+  updated_at: number;
+}
+
 export interface StartRequest {
   /**
    * Optional client-supplied id. If omitted, the server generates one and
@@ -46,7 +57,7 @@ export interface StartResponse {
   startedAt: number;
 }
 
-export interface PollResponse<TMeta = unknown> {
+export interface PollResponse<TMeta = unknown, TProgressData = unknown> {
   /** Wire protocol version. */
   protocolVersion: typeof PROTOCOL_VERSION;
 
@@ -60,6 +71,9 @@ export interface PollResponse<TMeta = unknown> {
 
   /** Server time when the upstream completed successfully, ms since epoch. */
   completed_at?: number;
+
+  /** Latest app-level progress update, if the upstream emitted one. */
+  progress?: ProgressState<TProgressData>;
 
   /**
    * New string data appended since the `since` offset the client requested.

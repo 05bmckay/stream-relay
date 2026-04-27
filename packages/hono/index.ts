@@ -74,6 +74,7 @@ export type {
   UpstreamContext,
   FinalState,
   HydratedState,
+  ProgressState,
   KVStore,
   KvStorageOptions,
 } from "../server";

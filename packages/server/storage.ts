@@ -15,7 +15,7 @@
  * into storage directly, so any layer you build between is fine.
  */
 
-import type { RelayOptions, FinalState } from "./index";
+import type { RelayOptions, FinalState, ProgressState } from "./index";
 
 export interface KVStore {
   get(key: string): Promise<string | null>;
@@ -29,6 +29,7 @@ interface PersistedState<TMeta> {
   lastEventAt: number;
   final?: FinalState<TMeta>;
   completed_at?: number;
+  progress?: ProgressState;
   error?: string;
 }
 
@@ -150,6 +151,26 @@ export function withKvStorage<TPayload, TMeta>(
       if (options.onAppend) await options.onAppend(id, _chunk, offset);
     },
 
+    onProgress: async (id, progress) => {
+      const prior = pendingState.get(id) ?? {
+        buffer: "",
+        status: "streaming" as const,
+        lastEventAt: Date.now(),
+      };
+      const state: PersistedState<TMeta> = {
+        ...prior,
+        progress,
+        lastEventAt: progress.updated_at,
+      };
+      pendingState.set(id, state);
+      if (flushInterval === 0) {
+        await setState(id, state);
+      } else {
+        scheduleFlush(id);
+      }
+      if (options.onProgress) await options.onProgress(id, progress);
+    },
+
     onComplete: async (id, final) => {
       const state: PersistedState<TMeta> = {
         buffer: final.text,
@@ -157,6 +178,7 @@ export function withKvStorage<TPayload, TMeta>(
         lastEventAt: Date.now(),
         final,
         completed_at: Date.now(),
+        progress: pendingState.get(id)?.progress,
       };
       pendingState.set(id, state);
       // Cancel any pending debounce; write final state immediately.
@@ -225,6 +247,7 @@ export function withKvStorage<TPayload, TMeta>(
           lastEventAt: parsed.lastEventAt,
           final: parsed.final,
           completed_at: parsed.completed_at,
+          progress: parsed.progress,
           error: parsed.error,
         };
       } catch (err) {
