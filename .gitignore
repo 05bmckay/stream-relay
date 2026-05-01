@@ -16,3 +16,6 @@ soak-test.mjs
 # scripts/release-github.mjs is committed; transient test scripts are not.
 scripts/live-test.mjs
 scripts/soak-test.mjs
+
+# Local-only planning/review notes
+.local-docs/

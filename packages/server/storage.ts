@@ -15,7 +15,7 @@
  * into storage directly, so any layer you build between is fine.
  */
 
-import type { RelayOptions, FinalState, ProgressState } from "./index";
+import type { RelayOptions, FinalState, ProgressState, RelayEvent } from "./index";
 
 export interface KVStore {
   get(key: string): Promise<string | null>;
@@ -23,8 +23,26 @@ export interface KVStore {
   delete?(key: string): Promise<void>;
 }
 
+type MaybePromise<T> = T | Promise<T>;
+
+export interface SqliteStatement {
+  run: (...params: unknown[]) => MaybePromise<unknown>;
+  get: (...params: unknown[]) => MaybePromise<unknown>;
+}
+
+export interface SqliteDatabase {
+  /** Optional direct exec hook used for table/index creation. */
+  exec?: (sql: string) => MaybePromise<unknown>;
+  /** Async sqlite wrappers commonly expose run/get directly. */
+  run?: (sql: string, params?: readonly unknown[]) => MaybePromise<unknown>;
+  get?: (sql: string, params?: readonly unknown[]) => MaybePromise<unknown>;
+  /** better-sqlite3 and node:sqlite expose prepared statements. */
+  prepare?: (sql: string) => SqliteStatement;
+}
+
 interface PersistedState<TMeta> {
   buffer: string;
+  events?: RelayEvent[];
   status: "streaming" | "complete" | "error";
   lastEventAt: number;
   final?: FinalState<TMeta>;
@@ -51,6 +69,13 @@ export interface KvStorageOptions {
   ttlSeconds?: number;
   /** Delete persisted terminal records when the core GC evicts them. Default true. */
   deleteOnGc?: boolean;
+}
+
+export interface SqliteStorageOptions extends KvStorageOptions {
+  /** Table used for persisted stream records. Default: `stream_relay`. */
+  tableName?: string;
+  /** Create the table/index on first use. Default true. */
+  initialize?: boolean;
 }
 
 /**
@@ -83,6 +108,7 @@ export function withKvStorage<TPayload, TMeta>(
   // a coherent state at some prior offset.
   const flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const pendingState = new Map<string, PersistedState<TMeta>>();
+  const seedPromises = new Map<string, Promise<PersistedState<TMeta>>>();
   const queues = new Map<string, Promise<unknown>>();
 
   const keyFor = (id: string) => `${prefix}${id}`;
@@ -98,6 +124,40 @@ export function withKvStorage<TPayload, TMeta>(
   };
   const setState = (id: string, state: PersistedState<TMeta>) =>
     enqueue(id, () => kv.set(keyFor(id), JSON.stringify(state), { ttlSeconds }));
+
+  const emptyState = (): PersistedState<TMeta> => ({
+    buffer: "",
+    events: [],
+    status: "streaming",
+    lastEventAt: Date.now(),
+  });
+
+  const seed = async (id: string): Promise<PersistedState<TMeta>> => {
+    const cached = pendingState.get(id);
+    if (cached) return cached;
+    const existing = seedPromises.get(id);
+    if (existing) return existing;
+
+    const promise = (async () => {
+      try {
+        const raw = await kv.get(keyFor(id));
+        if (!raw) return emptyState();
+        const parsed = JSON.parse(raw) as PersistedState<TMeta>;
+        return { ...parsed, events: parsed.events ?? [] };
+      } catch (err) {
+        console.error("[stream-relay] kv seed failed", err);
+        return emptyState();
+      }
+    })();
+
+    seedPromises.set(id, promise);
+    const state = await promise;
+    seedPromises.delete(id);
+    const current = pendingState.get(id);
+    if (current) return current;
+    pendingState.set(id, state);
+    return state;
+  };
 
   const scheduleFlush = (id: string) => {
     if (flushTimers.has(id)) return;
@@ -118,17 +178,14 @@ export function withKvStorage<TPayload, TMeta>(
     ...options,
 
     onAppend: async (id, _chunk, offset) => {
-      const prior = pendingState.get(id) ?? {
-        buffer: "",
-        status: "streaming" as const,
-        lastEventAt: Date.now(),
-      };
+      const prior = await seed(id);
       // Reconstruct the running buffer. We can't ask the relay core for
       // the full buffer here (it'd be circular), so we accumulate from
       // chunks. `offset` is the new total length, which lets us validate
       // accumulation matches.
-      const state = {
+      const state: PersistedState<TMeta> = {
         ...prior,
+        events: prior.events ?? [],
         buffer: prior.buffer + _chunk,
         lastEventAt: Date.now(),
       };
@@ -151,14 +208,33 @@ export function withKvStorage<TPayload, TMeta>(
       if (options.onAppend) await options.onAppend(id, _chunk, offset);
     },
 
-    onProgress: async (id, progress) => {
-      const prior = pendingState.get(id) ?? {
-        buffer: "",
-        status: "streaming" as const,
-        lastEventAt: Date.now(),
-      };
+    onEvent: async (id, event, eventOffset) => {
+      const prior = await seed(id);
+      const events = [...(prior.events ?? []), event];
       const state: PersistedState<TMeta> = {
         ...prior,
+        events,
+        lastEventAt: Date.now(),
+      };
+      pendingState.set(id, state);
+      if (eventOffset !== events.length) {
+        console.warn(
+          `[stream-relay] event offset mismatch for ${id}: ${events.length} vs ${eventOffset}`,
+        );
+      }
+      if (flushInterval === 0) {
+        await setState(id, state);
+      } else {
+        scheduleFlush(id);
+      }
+      if (options.onEvent) await options.onEvent(id, event, eventOffset);
+    },
+
+    onProgress: async (id, progress) => {
+      const prior = await seed(id);
+      const state: PersistedState<TMeta> = {
+        ...prior,
+        events: prior.events ?? [],
         progress,
         lastEventAt: progress.updated_at,
       };
@@ -172,13 +248,15 @@ export function withKvStorage<TPayload, TMeta>(
     },
 
     onComplete: async (id, final) => {
+      const pending = await seed(id);
       const state: PersistedState<TMeta> = {
         buffer: final.text,
+        events: final.events ?? pending.events ?? [],
         status: "complete",
         lastEventAt: Date.now(),
         final,
         completed_at: Date.now(),
-        progress: pendingState.get(id)?.progress,
+        progress: pending?.progress,
       };
       pendingState.set(id, state);
       // Cancel any pending debounce; write final state immediately.
@@ -198,11 +276,7 @@ export function withKvStorage<TPayload, TMeta>(
     },
 
     onError: async (id, message) => {
-      const prior = pendingState.get(id) ?? {
-        buffer: "",
-        status: "streaming" as const,
-        lastEventAt: Date.now(),
-      };
+      const prior = await seed(id);
       const state: PersistedState<TMeta> = {
         ...prior,
         status: "error",
@@ -225,6 +299,13 @@ export function withKvStorage<TPayload, TMeta>(
     },
 
     onGc: async (id) => {
+      const t = flushTimers.get(id);
+      if (t) {
+        clearTimeout(t);
+        flushTimers.delete(id);
+      }
+      pendingState.delete(id);
+      seedPromises.delete(id);
       if (options.onGc) await options.onGc(id);
       if (deleteOnGc && kv.delete) {
         await enqueue(id, () => kv.delete?.(keyFor(id)) ?? Promise.resolve());
@@ -243,6 +324,7 @@ export function withKvStorage<TPayload, TMeta>(
         const parsed = JSON.parse(raw) as PersistedState<TMeta>;
         return {
           buffer: parsed.buffer,
+          events: parsed.events ?? [],
           status: parsed.status,
           lastEventAt: parsed.lastEventAt,
           final: parsed.final,
@@ -256,6 +338,111 @@ export function withKvStorage<TPayload, TMeta>(
       }
     },
   };
+}
+
+/**
+ * SQLite-backed persistence for local Node servers. This is intentionally
+ * driver-neutral: pass a database object from `better-sqlite3`, `node:sqlite`,
+ * or an async wrapper that exposes `run/get`.
+ *
+ *   import Database from "better-sqlite3";
+ *   createRelayApp(withSqliteStorage(new Database("relay.db"), { upstream }));
+ *
+ * No sqlite driver is bundled with stream-relay; choose the one that fits your
+ * runtime and pass the opened database here.
+ */
+export function withSqliteStorage<TPayload, TMeta>(
+  db: SqliteDatabase,
+  options: RelayOptions<TPayload, TMeta> & SqliteStorageOptions,
+): RelayOptions<TPayload, TMeta> {
+  return withKvStorage(sqliteKvFromDatabase(db, options), options);
+}
+
+export function sqliteKvFromDatabase(
+  db: SqliteDatabase,
+  options: SqliteStorageOptions = {},
+): KVStore {
+  const table = validateSqliteIdentifier(options.tableName ?? "stream_relay");
+  const initialize = options.initialize ?? true;
+  let initPromise: Promise<void> | undefined;
+
+  const init = async () => {
+    if (!initialize) return;
+    if (!initPromise) {
+      initPromise = (async () => {
+        await execSql(db, `CREATE TABLE IF NOT EXISTS ${table} (key TEXT PRIMARY KEY, value TEXT NOT NULL, expires_at INTEGER)`);
+        await execSql(db, `CREATE INDEX IF NOT EXISTS ${table}_expires_at_idx ON ${table} (expires_at)`);
+      })();
+    }
+    await initPromise;
+  };
+
+  return {
+    get: async (key) => {
+      await init();
+      const row = await getSql<{ value: string; expires_at?: number | null }>(
+        db,
+        `SELECT value, expires_at FROM ${table} WHERE key = ?`,
+        [key],
+      );
+      if (!row) return null;
+      if (row.expires_at && row.expires_at <= Date.now()) {
+        await runSql(db, `DELETE FROM ${table} WHERE key = ?`, [key]);
+        return null;
+      }
+      return row.value;
+    },
+    set: async (key, value, opts) => {
+      await init();
+      const expiresAt = opts?.ttlSeconds ? Date.now() + opts.ttlSeconds * 1000 : null;
+      await runSql(
+        db,
+        `INSERT INTO ${table} (key, value, expires_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at`,
+        [key, value, expiresAt],
+      );
+    },
+    delete: async (key) => {
+      await init();
+      await runSql(db, `DELETE FROM ${table} WHERE key = ?`, [key]);
+    },
+  };
+}
+
+function validateSqliteIdentifier(identifier: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(identifier)) {
+    throw new Error(`invalid sqlite table name: ${identifier}`);
+  }
+  return identifier;
+}
+
+async function execSql(db: SqliteDatabase, sql: string): Promise<void> {
+  if (db.exec) {
+    await db.exec(sql);
+    return;
+  }
+  await runSql(db, sql, []);
+}
+
+async function runSql(db: SqliteDatabase, sql: string, params: readonly unknown[]): Promise<void> {
+  if (db.run) {
+    await db.run(sql, params);
+    return;
+  }
+  if (db.prepare) {
+    await db.prepare(sql).run(...params);
+    return;
+  }
+  throw new Error("sqlite database must expose run() or prepare()");
+}
+
+async function getSql<T>(db: SqliteDatabase, sql: string, params: readonly unknown[]): Promise<T | null | undefined> {
+  if (db.get) {
+    return (await db.get(sql, params)) as T | null | undefined;
+  }
+  if (db.prepare) {
+    return (await db.prepare(sql).get(...params)) as T | null | undefined;
+  }
+  throw new Error("sqlite database must expose get() or prepare()");
 }
 
 /**

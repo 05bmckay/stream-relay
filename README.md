@@ -21,11 +21,11 @@ If you control both ends and can use plain SSE or streamed `fetch` responses, yo
 ```
 +------------------+      poll every 400ms       +------------------+    long upstream     +------------------+
 |   React client   | --------------------------> |   stream-relay   | -----------------> |   LLM / agent    |
-|   useStream()    | <-- { append, nextOffset }- |     (server)     | <-- tokens ------- |  / any slow API  |
+|   useStream()    | <-- { append, events }----- |     (server)     | <-- tokens ------- |  / any slow API  |
 +------------------+                             +------------------+                    +------------------+
 ```
 
-The relay buffers upstream output in memory. The client polls `GET /streams/:id?since=N` and asks for string data past its last-known offset. On reload, the client sends the persisted offset and gets exactly the data it missed. No SSE, no WebSockets, no sticky load balancing required.
+The relay buffers upstream text and structured events in memory. The client polls `GET /streams/:id?since=N&eventSince=M` and asks for data past its last-known offsets. On reload, the client sends the persisted offsets and gets exactly the text/events it missed. No SSE, no WebSockets, no sticky load balancing required.
 
 ## Install
 
@@ -200,6 +200,75 @@ const { progress } = useStream({
 
 Progress is also persisted by the bundled KV and Durable Object storage helpers, so reloads can restore the latest known phase/message alongside the text offset.
 
+## Structured events
+
+Use `emit()` when your app needs ordered structured messages alongside the visible text stream: tool-call lifecycle events, JSON patches, usage metadata, questions, document snapshots, or app-specific UI updates.
+
+`write()` and `emit()` are intentionally separate channels:
+
+- `write(chunk)` appends to the plain text buffer and is consumed with `onChunk`.
+- `emit(event)` appends to the structured event log and is consumed with `onEvent`.
+- `progress(update)` stores the latest progress snapshot and is consumed with `onProgress`.
+
+```ts
+upstream: async ({ payload, write, emit, progress }) => {
+  progress({ phase: "retrieval", message: "Searching records..." });
+
+  emit({ type: "tool.start", name: "search_knowledge" });
+  const records = await searchKnowledge(payload.query);
+  emit({ type: "tool.end", name: "search_knowledge", count: records.length });
+
+  emit({
+    type: "patch",
+    op: { op: "add", path: "/sources", value: records },
+  });
+
+  write("Here is the answer: ");
+  write(await summarize(records));
+
+  emit({ type: "usage", inputTokens: 123, outputTokens: 45 });
+}
+```
+
+The relay adds `timestamp` when an event omits it. Events are replayable with their own event offset, so reconnects do not duplicate already-consumed events:
+
+```tsx
+type AppEvent =
+  | { type: "tool.start"; name: string; timestamp?: number }
+  | { type: "patch"; op: JsonPatchOperation; timestamp?: number };
+
+const { offset, eventOffset } = useStream<unknown, unknown, AppEvent>({
+  streamId,
+  resumeFrom: persisted.offset,
+  resumeEventsFrom: persisted.eventOffset,
+  onChunk: (append, nextOffset) => {
+    setText((text) => text + append);
+    save({ offset: nextOffset });
+  },
+  onEvent: (event, nextEventOffset) => {
+    switch (event.type) {
+      case "tool.start":
+        showTool(event.name);
+        break;
+      case "patch":
+        applyPatch(event.op);
+        break;
+    }
+    save({ eventOffset: nextEventOffset });
+  },
+});
+```
+
+Event ordering is guaranteed relative to other events, and text ordering is guaranteed relative to other text. Events are retained in memory until the stream is garbage-collected, so prefer `write()`/`onChunk` for high-frequency token text unless you specifically need text to be part of the structured event log.
+
+If your UI requires text deltas to participate in the same ordered log as tool events, emit text as events yourself:
+
+```ts
+emit({ type: "text.delta", text: "Hello" });
+emit({ type: "tool.start", name: "search" });
+emit({ type: "text.delta", text: " world" });
+```
+
 ## Persistence (optional)
 
 Default behavior is in-memory. If the server restarts, in-flight streams die with it. For most uses (single-region edge deploy, LLM proxying) this is fine. When you need completed stream output to survive deploys, evictions, or multi-day resume windows, opt into one of the bundled persistence helpers.
@@ -238,6 +307,25 @@ const { app } = createRelayApp(withKvStorage(myKv, {
 
 `withKvStorage` accepts any `{ get, set, delete? }` shape. Drop in Redis, Upstash, Cloudflare KV (via `kvFromCloudflare`), or your own database. Writes are debounced (default 500ms); set `flushIntervalMs: 0` for synchronous-per-chunk durability. Use `prefix` to namespace keys when sharing a store.
 
+### Local SQLite
+
+For a local Node/Hono relay (not Cloudflare Workers), use `withSqliteStorage`. The package does not bundle a sqlite driver; pass an opened database from `better-sqlite3`, `node:sqlite`, or an async wrapper that exposes `run/get`.
+
+```ts
+import Database from "better-sqlite3";
+import { createRelayApp, withSqliteStorage } from "@hs-uix/stream-relay/hono";
+
+const db = new Database("stream-relay.db");
+
+const { app } = createRelayApp(withSqliteStorage(db, {
+  tableName: "stream_relay",
+  ttlSeconds: 60 * 60 * 24, // optional: expire rows after 1 day
+  upstream: async ({ payload, write, emit }) => { /* ... */ },
+}));
+```
+
+`withSqliteStorage` creates a simple table on first use by default and stores the same persisted stream snapshots as the KV helper. It supports the same `flushIntervalMs`, `ttlSeconds`, and `deleteOnGc` options. It is exported from `/server` and `/hono`; Workers should use `withDurableStorage()` instead.
+
 ### Roll your own
 
 The persistence helpers are thin wrappers over optional callbacks on `RelayOptions`. If you want different semantics (chunked storage, compression, multi-tenant key prefixing), wire `onAppend`, `onProgress`, `onComplete`, `onError`, and `hydrate` directly. The relay core never reaches into storage.
@@ -268,9 +356,12 @@ The same `auth` option works on both the Worker and Hono adapters. Worker auth r
 | `streamId` | required | Stream to subscribe to (`null` = inert) |
 | `fetcher` | global `fetch` | HTTP client (use `hubspot.fetch` in extensions) |
 | `intervalMs` | 400 | Poll cadence |
-| `resumeFrom` | 0 | JavaScript string offset, or `"live"` to skip backlog |
+| `resumeFrom` | 0 | JavaScript string offset, or `"live"` to skip text backlog |
+| `resumeEventsFrom` | 0 (`"live"` when `resumeFrom` is `"live"`) | Structured event offset, or `"live"` to skip event backlog |
 | `reconnect.serverStallMs` | 90000 | Give-up threshold for silent server |
 | `reconnect.staleResyncMs` | 3000 | Reconnecting UI hint threshold |
+| `onChunk` | optional | Receives text appended since the previous text offset |
+| `onEvent` | optional | Receives structured events and their next event offset |
 | `onProgress` | optional | Receives latest app-level progress updates |
 
 Full JSDoc on every option in [`packages/client/index.ts`](./packages/client/index.ts).
@@ -291,23 +382,28 @@ Cloudflare Workers + Durable Object. Subclass `RelayBuffer` to wire your upstrea
 
 Persistence helper for any KV-shaped store. Accepts `{ get, set, delete? }`. Use directly with `createRelay` or wrap a Hono app's options.
 
+### `withSqliteStorage(db, options)` from `@hs-uix/stream-relay/server`
+
+Local SQLite persistence helper for Node/Hono relays. Accepts a driver-neutral database object with `prepare()` (better-sqlite3 / node:sqlite) or `run/get` methods. Use directly with `createRelay` or wrap a Hono app's options. Not exported from the Worker entry point.
+
 ## Wire protocol
 
 The contract is small enough to reimplement in any language:
 
 ```
 POST /streams          { streamId?, payload? }
-                       -> { protocolVersion: 1, streamId, startedAt }
+                       -> { protocolVersion: 2, streamId, startedAt }
 
-GET  /streams/:id?since=N
-                       -> { protocolVersion: 1, streamId, status, complete,
+GET  /streams/:id?since=N&eventSince=M
+                       -> { protocolVersion: 2, streamId, status, complete,
                             completed_at?, progress?, append, nextOffset,
+                            events, nextEventOffset,
                             lastEventAt, serverNow,
-                            final?: { text, meta? }, error?,
+                            final?: { text, events?, meta? }, error?,
                             errorInfo?: { code, message } }
 ```
 
-`status` is one of `streaming`, `complete`, `error`, `not_found`. `complete` is `true` only after the upstream resolves successfully; `completed_at` is populated at that point with server time in ms since epoch. `progress` is the latest app-level progress update, shaped as `{ phase?, message?, data?, updated_at }`. `since` and `nextOffset` are JavaScript string offsets (UTF-16 code units), matching the package's string-in/string-out API. Clients use `serverNow - lastEventAt > serverStallMs` to detect dead streams without trusting their own clock.
+`status` is one of `streaming`, `complete`, `error`, `not_found`. `complete` is `true` only after the upstream resolves successfully; `completed_at` is populated at that point with server time in ms since epoch. `progress` is the latest app-level progress update, shaped as `{ phase?, message?, data?, updated_at }`. `since` and `nextOffset` are JavaScript string offsets (UTF-16 code units), matching the package's string-in/string-out API. `eventSince` and `nextEventOffset` are event-log offsets (counts, not byte/string offsets). Clients use `serverNow - lastEventAt > serverStallMs` to detect dead streams without trusting their own clock.
 
 ## What we tested
 

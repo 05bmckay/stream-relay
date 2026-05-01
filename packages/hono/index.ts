@@ -58,15 +58,22 @@ export function createRelayApp<TPayload = unknown, TMeta = unknown>(
 
   app.get("/streams/:id", async (c) => {
     const streamId = c.req.param("id");
-    const since = Number(c.req.query("since") ?? 0);
-    const result = await relay.handlePoll(streamId, since);
+    const since = parseOffset(c.req.query("since"));
+    const eventSince = parseOffset(c.req.query("eventSince"));
+    const result = await relay.handlePoll(streamId, since, eventSince);
     return c.json(result);
   });
 
   return { app, relay };
 }
 
-export { createRelay, withKvStorage, kvFromCloudflare } from "../server";
+function parseOffset(value: string | undefined): number {
+  if (value === undefined) return 0;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+export { createRelay, withKvStorage, withSqliteStorage, kvFromCloudflare, sqliteKvFromDatabase } from "../server";
 export type {
   Relay,
   RelayOptions,
@@ -75,6 +82,9 @@ export type {
   FinalState,
   HydratedState,
   ProgressState,
+  RelayEvent,
   KVStore,
   KvStorageOptions,
+  SqliteDatabase,
+  SqliteStorageOptions,
 } from "../server";

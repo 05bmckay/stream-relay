@@ -11,7 +11,7 @@
  * and lives outside this package.
  */
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 export type StreamStatus = "streaming" | "complete" | "error" | "not_found";
 
@@ -29,6 +29,13 @@ export interface ProgressState<TData = unknown> {
   data?: TData;
   /** Server time when progress was last updated, ms since epoch. */
   updated_at: number;
+}
+
+export interface RelayEvent<TType extends string = string> {
+  /** Host-defined event discriminator, e.g. "tool.start", "patch", "text.delta". */
+  type: TType;
+  /** Server time assigned by the relay if omitted, ms since epoch. */
+  timestamp?: number;
 }
 
 export interface StartRequest {
@@ -57,7 +64,7 @@ export interface StartResponse {
   startedAt: number;
 }
 
-export interface PollResponse<TMeta = unknown, TProgressData = unknown> {
+export interface PollResponse<TMeta = unknown, TProgressData = unknown, TEvent extends RelayEvent = RelayEvent> {
   /** Wire protocol version. */
   protocolVersion: typeof PROTOCOL_VERSION;
 
@@ -88,6 +95,15 @@ export interface PollResponse<TMeta = unknown, TProgressData = unknown> {
    */
   nextOffset: number;
 
+  /** Ordered structured events emitted since the `eventSince` offset. */
+  events: TEvent[];
+
+  /**
+   * Absolute event-log offset after `events`. The next poll should send
+   * `?eventSince=nextEventOffset` to resume without duplicates.
+   */
+  nextEventOffset: number;
+
   /**
    * Server's monotonic timestamp of the most recent upstream event, even
    * silent ones (tool calls, thinking deltas). The client uses this to
@@ -110,6 +126,8 @@ export interface PollResponse<TMeta = unknown, TProgressData = unknown> {
    */
   final?: {
     text: string;
+    /** Snapshot of structured events at completion. */
+    events?: TEvent[];
     meta?: TMeta;
   };
 

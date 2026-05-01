@@ -14,6 +14,7 @@ import {
   PROTOCOL_VERSION,
   type PollResponse,
   type ProgressState,
+  type RelayEvent,
   type RelayError,
   type StartRequest,
   type StartResponse,
@@ -29,9 +30,8 @@ import {
  * the `payload` from `StartRequest` and a `writer` to push string data back
  * into the relay buffer. Resolve to mark `complete`; throw to mark `error`.
  *
- * The writer is intentionally string-oriented (string in, string out). Hosts
- * doing structured streaming (JSON events, SSE frames) should serialize on
- * the way in and parse on the way out — keeps the relay dumb.
+ * Hosts can stream plain visible text with `write()` and structured side-channel
+ * messages with `emit()`. These are intentionally separate resumable channels.
  */
 export type UpstreamHandler<TPayload = unknown, TMeta = unknown> = (
   ctx: UpstreamContext<TPayload, TMeta>,
@@ -40,8 +40,10 @@ export type UpstreamHandler<TPayload = unknown, TMeta = unknown> = (
 export interface UpstreamContext<TPayload = unknown, TMeta = unknown> {
   streamId: string;
   payload: TPayload;
-  /** Append string data to the buffer. Bumps `lastEventAt`. */
+  /** Append string data to the visible text buffer. Bumps `lastEventAt`. */
   write: (chunk: string) => void;
+  /** Emit an ordered structured event without appending to the visible text buffer. */
+  emit: <TEvent extends RelayEvent>(event: TEvent) => void;
   /**
    * Bump `lastEventAt` without writing. Use during long silent operations
    * (tool calls, "thinking" phases) to keep the client's stall detector
@@ -74,6 +76,12 @@ export interface RelayOptions<TPayload = unknown, TMeta = unknown> {
    * they exist so durable backends can layer on without forking.
    */
   onAppend?: (streamId: string, chunk: string, offset: number) => Promise<void>;
+  /**
+   * Called after an event has been appended. `eventOffset` is the new total
+   * event count (1-indexed), equivalent to the `nextEventOffset` a client
+   * poll would see immediately after this event.
+   */
+  onEvent?: (streamId: string, event: RelayEvent, eventOffset: number) => Promise<void>;
   onComplete?: (streamId: string, final: FinalState<TMeta>) => Promise<void>;
   onError?: (streamId: string, error: string) => Promise<void>;
   onProgress?: (streamId: string, progress: ProgressState) => Promise<void>;
@@ -96,11 +104,14 @@ export interface RelayOptions<TPayload = unknown, TMeta = unknown> {
 
 export interface FinalState<TMeta = unknown> {
   text: string;
+  /** Snapshot of structured events at completion. */
+  events?: RelayEvent[];
   meta?: TMeta;
 }
 
 export interface HydratedState<TMeta = unknown> {
   buffer: string;
+  events?: RelayEvent[];
   status: Exclude<StreamStatus, "not_found">;
   lastEventAt: number;
   final?: FinalState<TMeta>;
@@ -114,6 +125,7 @@ export interface Relay {
   handlePoll: (
     streamId: string,
     since: number,
+    eventSince?: number,
   ) => Promise<PollResponse>;
   /** Test/admin helper. Returns undefined if unknown. */
   inspect: (streamId: string) => StreamRecord | undefined;
@@ -126,6 +138,7 @@ export interface Relay {
 interface StreamRecord<TMeta = unknown> {
   streamId: string;
   buffer: string;
+  events: RelayEvent[];
   status: StreamStatus;
   lastEventAt: number;
   lastPolledAt: number;
@@ -135,6 +148,8 @@ interface StreamRecord<TMeta = unknown> {
   completed_at?: number;
   progress?: ProgressState;
   abort: AbortController;
+  /** Serializes async persistence hooks while keeping write()/emit() synchronous. */
+  hookQueue: Promise<unknown>;
   inactivityTimer?: ReturnType<typeof setTimeout>;
 }
 
@@ -190,9 +205,7 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
       rec.lastEventAt = now;
       rec.abort.abort();
       if (options.onError) {
-        options
-          .onError(rec.streamId, message)
-          .catch((e) => console.error("[relay] onError hook failed", e));
+        queueHook(rec, "onError", () => options.onError!(rec.streamId, message));
       }
     }, ttl);
   }
@@ -212,11 +225,13 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
     const rec: StreamRecord<TMeta> = {
       streamId,
       buffer: "",
+      events: [],
       status: "streaming",
       lastEventAt: now,
       lastPolledAt: now,
       startedAt: now,
       abort,
+      hookQueue: Promise.resolve(),
     };
     streams.set(streamId, rec);
     scheduleInactivityAbort(rec);
@@ -227,6 +242,18 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
     void runUpstream(rec, req.payload as TPayload);
 
     return { protocolVersion: PROTOCOL_VERSION, streamId, startedAt: now };
+  }
+
+  function queueHook(
+    rec: StreamRecord<TMeta>,
+    label: string,
+    fn: () => Promise<void>,
+  ): void {
+    const next = rec.hookQueue
+      .catch(() => undefined)
+      .then(fn)
+      .catch((err) => console.error(`[relay] ${label} hook failed`, err));
+    rec.hookQueue = next;
   }
 
   async function runUpstream(
@@ -241,9 +268,20 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
         rec.buffer += chunk;
         rec.lastEventAt = Date.now();
         if (options.onAppend) {
-          options
-            .onAppend(rec.streamId, chunk, rec.buffer.length)
-            .catch((err) => console.error("[relay] onAppend failed", err));
+          const offset = rec.buffer.length;
+          queueHook(rec, "onAppend", () => options.onAppend!(rec.streamId, chunk, offset));
+        }
+      },
+      emit: (event) => {
+        if (rec.status !== "streaming") return;
+        const now = Date.now();
+        const normalized = normalizeEvent(event, now);
+        if (!normalized) return;
+        rec.events.push(normalized);
+        rec.lastEventAt = now;
+        if (options.onEvent) {
+          const eventOffset = rec.events.length;
+          queueHook(rec, "onEvent", () => options.onEvent!(rec.streamId, normalized, eventOffset));
         }
       },
       heartbeat: () => {
@@ -256,9 +294,7 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
         rec.progress = progress;
         rec.lastEventAt = now;
         if (options.onProgress) {
-          options
-            .onProgress(rec.streamId, progress)
-            .catch((err) => console.error("[relay] onProgress failed", err));
+          queueHook(rec, "onProgress", () => options.onProgress!(rec.streamId, progress));
         }
       },
       signal: rec.abort.signal,
@@ -273,6 +309,7 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
       }
       const final: FinalState<TMeta> = {
         text: rec.buffer,
+        events: rec.events.slice(),
         meta: meta ?? undefined,
       };
       const completedAt = Date.now();
@@ -281,9 +318,7 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
       rec.completed_at = completedAt;
       rec.lastEventAt = completedAt;
       if (options.onComplete) {
-        options
-          .onComplete(rec.streamId, final)
-          .catch((err) => console.error("[relay] onComplete failed", err));
+        queueHook(rec, "onComplete", () => options.onComplete!(rec.streamId, final));
       }
     } catch (err) {
       if (rec.status !== "streaming") return;
@@ -296,9 +331,7 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
       rec.error = message;
       rec.lastEventAt = Date.now();
       if (options.onError) {
-        options
-          .onError(rec.streamId, message)
-          .catch((e) => console.error("[relay] onError hook failed", e));
+        queueHook(rec, "onError", () => options.onError!(rec.streamId, message));
       }
     }
   }
@@ -306,6 +339,7 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
   async function handlePoll(
     streamId: string,
     since: number,
+    eventSince = 0,
   ): Promise<PollResponse> {
     let rec = streams.get(streamId);
 
@@ -318,6 +352,7 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
         rec = {
           streamId,
           buffer: hydrated.buffer,
+          events: hydrated.events ?? [],
           status: interrupted ? "error" : hydrated.status,
           lastEventAt: interrupted ? now : hydrated.lastEventAt,
           lastPolledAt: now,
@@ -329,12 +364,11 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
             ? "stream was interrupted before completion"
             : hydrated.error,
           abort: new AbortController(),
+          hookQueue: Promise.resolve(),
         };
         streams.set(streamId, rec);
         if (interrupted && options.onError) {
-          options
-            .onError(streamId, rec.error ?? "stream was interrupted before completion")
-            .catch((e) => console.error("[relay] onError hook failed", e));
+          queueHook(rec, "onError", () => options.onError!(streamId, rec!.error ?? "stream was interrupted before completion"));
         }
       }
     }
@@ -352,6 +386,8 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
         complete: false,
         append: "",
         nextOffset: 0,
+        events: [],
+        nextEventOffset: 0,
         lastEventAt: 0,
         serverNow: now,
         error: errorInfo.message,
@@ -367,6 +403,10 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
       ? Math.max(0, Math.min(since, rec.buffer.length))
       : rec.buffer.length;
     const append = rec.buffer.slice(safeSince);
+    const safeEventSince = Number.isFinite(eventSince)
+      ? Math.max(0, Math.min(eventSince, rec.events.length))
+      : rec.events.length;
+    const events = rec.events.slice(safeEventSince);
 
     const errorInfo = rec.status === "error"
       ? errorInfoFor(rec.error ?? "stream error")
@@ -381,12 +421,25 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
       progress: rec.progress,
       append,
       nextOffset: rec.buffer.length,
+      events,
+      nextEventOffset: rec.events.length,
       lastEventAt: rec.lastEventAt,
       serverNow: now,
       final: rec.status === "complete" ? rec.final : undefined,
       error: rec.status === "error" ? rec.error : undefined,
       errorInfo,
     };
+  }
+
+  function normalizeEvent<TEvent extends RelayEvent>(
+    event: TEvent,
+    timestamp: number,
+  ): TEvent | null {
+    if (!event || typeof event.type !== "string") {
+      console.warn("[relay] dropping malformed event; expected an object with a string type");
+      return null;
+    }
+    return { ...event, timestamp: event.timestamp ?? timestamp } as TEvent;
   }
 
   function normalizeProgress(
@@ -416,6 +469,6 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
 }
 
 export type { StreamRecord };
-export type { PollResponse, ProgressState, StartRequest, StartResponse, StreamStatus } from "../shared/protocol";
-export { withKvStorage, kvFromCloudflare } from "./storage";
-export type { KVStore, KvStorageOptions } from "./storage";
+export type { PollResponse, ProgressState, RelayEvent, StartRequest, StartResponse, StreamStatus } from "../shared/protocol";
+export { withKvStorage, withSqliteStorage, kvFromCloudflare, sqliteKvFromDatabase } from "./storage";
+export type { KVStore, KvStorageOptions, SqliteDatabase, SqliteStorageOptions } from "./storage";

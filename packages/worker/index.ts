@@ -13,7 +13,7 @@
  */
 
 import { createRelay, type RelayOptions, type Relay, type FinalState, type ProgressState } from "../server";
-import type { StartRequest } from "../shared/protocol";
+import type { RelayEvent, StartRequest } from "../shared/protocol";
 
 // Re-exported so users can construct option types without importing from
 // nested paths.
@@ -25,6 +25,7 @@ export type {
   FinalState,
   HydratedState,
   ProgressState,
+  RelayEvent,
   KVStore,
   KvStorageOptions,
 } from "../server";
@@ -71,7 +72,10 @@ export function withDurableStorage<TPayload, TMeta>(
   // adapted to DO storage's API.
   const flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const pendingBuffer = new Map<string, string>();
+  const pendingEvents = new Map<string, RelayEvent[]>();
   const pendingProgress = new Map<string, ProgressState>();
+  const seeded = new Set<string>();
+  const seedPromises = new Map<string, Promise<void>>();
   const queues = new Map<string, Promise<unknown>>();
 
   const enqueue = <T>(id: string, fn: () => Promise<T>) => {
@@ -85,6 +89,40 @@ export function withDurableStorage<TPayload, TMeta>(
     return next;
   };
 
+  const seed = async (id: string): Promise<void> => {
+    if (seeded.has(id)) return;
+    const existing = seedPromises.get(id);
+    if (existing) return existing;
+
+    const promise = (async () => {
+      try {
+        const saved = await state.storage.get<{
+          buffer: string;
+          events?: RelayEvent[];
+          progress?: ProgressState;
+        }>(`relay:${id}`);
+        if (saved) {
+          pendingBuffer.set(id, saved.buffer);
+          pendingEvents.set(id, saved.events ?? []);
+          if (saved.progress) pendingProgress.set(id, saved.progress);
+        } else {
+          pendingBuffer.set(id, "");
+          pendingEvents.set(id, []);
+        }
+      } catch (err) {
+        console.error("[stream-relay] DO seed failed", err);
+        pendingBuffer.set(id, pendingBuffer.get(id) ?? "");
+        pendingEvents.set(id, pendingEvents.get(id) ?? []);
+      } finally {
+        seeded.add(id);
+        seedPromises.delete(id);
+      }
+    })();
+
+    seedPromises.set(id, promise);
+    return promise;
+  };
+
   const scheduleFlush = (id: string) => {
     if (flushTimers.has(id)) return;
     const timer = setTimeout(async () => {
@@ -94,6 +132,7 @@ export function withDurableStorage<TPayload, TMeta>(
       try {
         await enqueue(id, () => state.storage.put(`relay:${id}`, {
           buffer,
+          events: pendingEvents.get(id) ?? [],
           status: "streaming" as const,
           lastEventAt: Date.now(),
           progress: pendingProgress.get(id),
@@ -109,12 +148,14 @@ export function withDurableStorage<TPayload, TMeta>(
     ...options,
 
     onAppend: async (id, chunk, offset) => {
+      await seed(id);
       const prior = pendingBuffer.get(id) ?? "";
       const next = prior + chunk;
       pendingBuffer.set(id, next);
       if (flushInterval === 0) {
         await enqueue(id, () => state.storage.put(`relay:${id}`, {
           buffer: next,
+          events: pendingEvents.get(id) ?? [],
           status: "streaming" as const,
           lastEventAt: Date.now(),
           progress: pendingProgress.get(id),
@@ -125,13 +166,41 @@ export function withDurableStorage<TPayload, TMeta>(
       if (options.onAppend) await options.onAppend(id, chunk, offset);
     },
 
+    onEvent: async (id, event, eventOffset) => {
+      await seed(id);
+      const prior = pendingEvents.get(id) ?? [];
+      const events = [...prior, event];
+      pendingEvents.set(id, events);
+      if (eventOffset !== events.length) {
+        console.warn(
+          `[stream-relay] event offset mismatch for ${id}: ${events.length} vs ${eventOffset}`,
+        );
+      }
+      const buffer = pendingBuffer.get(id) ?? "";
+      pendingBuffer.set(id, buffer);
+      if (flushInterval === 0) {
+        await enqueue(id, () => state.storage.put(`relay:${id}`, {
+          buffer,
+          events,
+          status: "streaming" as const,
+          lastEventAt: Date.now(),
+          progress: pendingProgress.get(id),
+        }));
+      } else {
+        scheduleFlush(id);
+      }
+      if (options.onEvent) await options.onEvent(id, event, eventOffset);
+    },
+
     onProgress: async (id, progress) => {
+      await seed(id);
       pendingProgress.set(id, progress);
       const buffer = pendingBuffer.get(id) ?? "";
       pendingBuffer.set(id, buffer);
       if (flushInterval === 0) {
         await enqueue(id, () => state.storage.put(`relay:${id}`, {
           buffer,
+          events: pendingEvents.get(id) ?? [],
           status: "streaming" as const,
           lastEventAt: progress.updated_at,
           progress,
@@ -143,18 +212,23 @@ export function withDurableStorage<TPayload, TMeta>(
     },
 
     onComplete: async (id, final) => {
+      await seed(id);
       const t = flushTimers.get(id);
       if (t) {
         clearTimeout(t);
         flushTimers.delete(id);
       }
       const progress = pendingProgress.get(id);
+      const events = final.events ?? pendingEvents.get(id) ?? [];
       pendingBuffer.delete(id);
+      pendingEvents.delete(id);
       pendingProgress.delete(id);
+      seeded.delete(id);
       try {
         const completedAt = Date.now();
         await enqueue(id, () => state.storage.put(`relay:${id}`, {
           buffer: final.text,
+          events,
           status: "complete",
           lastEventAt: completedAt,
           final,
@@ -168,18 +242,23 @@ export function withDurableStorage<TPayload, TMeta>(
     },
 
     onError: async (id, message) => {
+      await seed(id);
       const t = flushTimers.get(id);
       if (t) {
         clearTimeout(t);
         flushTimers.delete(id);
       }
       const buffer = pendingBuffer.get(id) ?? "";
+      const events = pendingEvents.get(id) ?? [];
       const progress = pendingProgress.get(id);
       pendingBuffer.delete(id);
+      pendingEvents.delete(id);
       pendingProgress.delete(id);
+      seeded.delete(id);
       try {
         await enqueue(id, () => state.storage.put(`relay:${id}`, {
           buffer,
+          events,
           status: "error",
           lastEventAt: Date.now(),
           error: message,
@@ -192,6 +271,16 @@ export function withDurableStorage<TPayload, TMeta>(
     },
 
     onGc: async (id) => {
+      const t = flushTimers.get(id);
+      if (t) {
+        clearTimeout(t);
+        flushTimers.delete(id);
+      }
+      pendingBuffer.delete(id);
+      pendingEvents.delete(id);
+      pendingProgress.delete(id);
+      seeded.delete(id);
+      seedPromises.delete(id);
       if (options.onGc) await options.onGc(id);
       await enqueue(id, () => state.storage.delete(`relay:${id}`));
     },
@@ -204,6 +293,7 @@ export function withDurableStorage<TPayload, TMeta>(
       try {
         const saved = await state.storage.get<{
           buffer: string;
+          events?: RelayEvent[];
           status: "streaming" | "complete" | "error";
           lastEventAt: number;
           final?: FinalState<TMeta>;
@@ -214,6 +304,7 @@ export function withDurableStorage<TPayload, TMeta>(
         if (!saved) return null;
         return {
           buffer: saved.buffer,
+          events: saved.events ?? [],
           status: saved.status,
           lastEventAt: saved.lastEventAt,
           final: saved.final,
@@ -276,8 +367,9 @@ export abstract class RelayBuffer<TPayload = unknown, TMeta = unknown> {
 
     if (request.method === "GET" && url.pathname === "/poll") {
       const streamId = url.searchParams.get("id") ?? "";
-      const since = Number(url.searchParams.get("since") ?? 0);
-      const result = await this.relay.handlePoll(streamId, since);
+      const since = parseOffset(url.searchParams.get("since"));
+      const eventSince = parseOffset(url.searchParams.get("eventSince"));
+      const result = await this.relay.handlePoll(streamId, since, eventSince);
       return Response.json(result);
     }
 
@@ -288,6 +380,12 @@ export abstract class RelayBuffer<TPayload = unknown, TMeta = unknown> {
 // ─────────────────────────────────────────────────────────────────────────
 // Worker entry: routes external requests into the right DO instance.
 // ─────────────────────────────────────────────────────────────────────────
+
+function parseOffset(value: string | null): number {
+  if (value === null) return 0;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
 
 export interface WorkerEnv {
   /** Binding name for your RelayBuffer subclass DO namespace. */
@@ -361,9 +459,10 @@ export function createRelayWorker<Env extends WorkerEnv = WorkerEnv>(options: Re
       ) {
         const streamId = segments[1];
         const since = url.searchParams.get("since") ?? "0";
+        const eventSince = url.searchParams.get("eventSince") ?? "0";
         const stub = env.RELAY.get(env.RELAY.idFromName(streamId));
         return stub.fetch(
-          `https://relay/poll?id=${encodeURIComponent(streamId)}&since=${since}`,
+          `https://relay/poll?id=${encodeURIComponent(streamId)}&since=${since}&eventSince=${eventSince}`,
         );
       }
 

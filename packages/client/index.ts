@@ -10,13 +10,13 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import type { PollResponse, ProgressState } from "../shared/protocol";
+import type { PollResponse, ProgressState, RelayEvent } from "../shared/protocol";
 
 // ─────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────
 
-export interface UseStreamOptions<TMeta = unknown, TProgressData = unknown> {
+export interface UseStreamOptions<TMeta = unknown, TProgressData = unknown, TEvent extends RelayEvent = RelayEvent> {
   /** Base URL of your deployed relay (no trailing slash). */
   proxyUrl: string;
 
@@ -59,7 +59,14 @@ export interface UseStreamOptions<TMeta = unknown, TProgressData = unknown> {
    */
   resumeFrom?: number | "live";
 
+  /**
+   * Where to start reading structured events from. Defaults to `0`, or
+   * `"live"` when `resumeFrom` is `"live"`.
+   */
+  resumeEventsFrom?: number | "live";
+
   onChunk?: (append: string, nextOffset: number) => void;
+  onEvent?: (event: TEvent, nextEventOffset: number) => void;
   onProgress?: (progress: ProgressState<TProgressData>) => void;
   onDone?: (final: { text: string; meta?: TMeta }) => void;
   onError?: (error: Error) => void;
@@ -68,8 +75,10 @@ export interface UseStreamOptions<TMeta = unknown, TProgressData = unknown> {
 export interface UseStreamResult<TProgressData = unknown> {
   isStreaming: boolean;
   reconnecting: boolean;
-  /** Persist alongside `streamId` to enable cross-reload resume. */
+  /** Persist alongside `streamId` to enable cross-reload text resume. */
   offset: number;
+  /** Persist alongside `streamId` to enable cross-reload event resume. */
+  eventOffset: number;
   /** Latest app-level progress update emitted by the upstream. */
   progress?: ProgressState<TProgressData>;
 }
@@ -101,8 +110,8 @@ export class StreamStalledError extends Error {
 // Hook
 // ─────────────────────────────────────────────────────────────────────────
 
-export function useStream<TMeta = unknown, TProgressData = unknown>(
-  options: UseStreamOptions<TMeta, TProgressData>,
+export function useStream<TMeta = unknown, TProgressData = unknown, TEvent extends RelayEvent = RelayEvent>(
+  options: UseStreamOptions<TMeta, TProgressData, TEvent>,
 ): UseStreamResult<TProgressData> {
   const {
     proxyUrl,
@@ -112,6 +121,7 @@ export function useStream<TMeta = unknown, TProgressData = unknown>(
     enabled = true,
     reconnect,
     resumeFrom = 0,
+    resumeEventsFrom = resumeFrom === "live" ? "live" : 0,
   } = options;
 
   const staleResyncMs = reconnect?.staleResyncMs ?? DEFAULTS.staleResyncMs;
@@ -123,17 +133,20 @@ export function useStream<TMeta = unknown, TProgressData = unknown>(
   const [isStreaming, setIsStreaming] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
   const [offset, setOffset] = useState(0);
+  const [eventOffset, setEventOffset] = useState(0);
   const [progress, setProgress] = useState<ProgressState<TProgressData> | undefined>();
   const [activeStreamId, setActiveStreamId] = useState<string | null>(null);
 
   // Refs so the loop doesn't restart when callers pass inline handlers/fetchers.
   const onChunkRef = useRef(options.onChunk);
+  const onEventRef = useRef(options.onEvent);
   const onProgressRef = useRef(options.onProgress);
   const onDoneRef = useRef(options.onDone);
   const onErrorRef = useRef(options.onError);
   const fetcherRef = useRef(fetcher);
   useEffect(() => {
     onChunkRef.current = options.onChunk;
+    onEventRef.current = options.onEvent;
     onProgressRef.current = options.onProgress;
     onDoneRef.current = options.onDone;
     onErrorRef.current = options.onError;
@@ -151,6 +164,7 @@ export function useStream<TMeta = unknown, TProgressData = unknown>(
     //   "live" → ask for current end-of-buffer; we'll seed from first poll.
     //   number → resume from there.
     let currentOffset = resumeFrom === "live" ? -1 : resumeFrom;
+    let currentEventOffset = resumeEventsFrom === "live" ? -1 : resumeEventsFrom;
     let lastAdvanceAt = Date.now();
     let lastProgressUpdatedAt = 0;
     let retries = 0;
@@ -160,6 +174,7 @@ export function useStream<TMeta = unknown, TProgressData = unknown>(
     setReconnecting(false);
     setProgress(undefined);
     setOffset(typeof currentOffset === "number" && currentOffset >= 0 ? currentOffset : 0);
+    setEventOffset(typeof currentEventOffset === "number" && currentEventOffset >= 0 ? currentEventOffset : 0);
 
     const sleep = (ms: number) =>
       new Promise<void>((resolve) => {
@@ -191,13 +206,17 @@ export function useStream<TMeta = unknown, TProgressData = unknown>(
         currentOffset < 0
           ? Number.MAX_SAFE_INTEGER
           : currentOffset;
+      const eventSinceParam =
+        currentEventOffset < 0
+          ? Number.MAX_SAFE_INTEGER
+          : currentEventOffset;
 
       let res: Response;
       try {
         inFlight = new AbortController();
         const fetchImpl = fetcherRef.current ?? fetch;
         res = await fetchImpl(
-          `${proxyUrl}/streams/${encodeURIComponent(streamId)}?since=${sinceParam}`,
+          `${proxyUrl}/streams/${encodeURIComponent(streamId)}?since=${sinceParam}&eventSince=${eventSinceParam}`,
           { method: "GET", signal: inFlight.signal },
         );
       } catch (err) {
@@ -215,9 +234,9 @@ export function useStream<TMeta = unknown, TProgressData = unknown>(
         );
       }
 
-      let data: PollResponse<TMeta, TProgressData>;
+      let data: PollResponse<TMeta, TProgressData, TEvent>;
       try {
-        data = (await res.json()) as PollResponse<TMeta, TProgressData>;
+        data = (await res.json()) as PollResponse<TMeta, TProgressData, TEvent>;
       } catch (err) {
         return handleTransientError(err);
       }
@@ -245,6 +264,19 @@ export function useStream<TMeta = unknown, TProgressData = unknown>(
         setOffset(currentOffset);
         lastAdvanceAt = Date.now();
         onChunkRef.current?.(data.append, currentOffset);
+      }
+
+      if (currentEventOffset < 0) {
+        currentEventOffset = data.nextEventOffset;
+        setEventOffset(currentEventOffset);
+      } else if (data.events.length > 0) {
+        const firstEventOffset = currentEventOffset;
+        currentEventOffset = data.nextEventOffset;
+        setEventOffset(currentEventOffset);
+        lastAdvanceAt = Date.now();
+        data.events.forEach((event, index) => {
+          onEventRef.current?.(event, firstEventOffset + index + 1);
+        });
       }
 
       // Reconnecting hint: server says streaming, client hasn't seen
@@ -325,6 +357,7 @@ export function useStream<TMeta = unknown, TProgressData = unknown>(
     serverStallMs,
     maxFetchRetries,
     retryBackoffMs,
+    resumeEventsFrom,
   ]);
 
   const currentStreamOwnsState = !!streamId && activeStreamId === streamId;
@@ -333,6 +366,7 @@ export function useStream<TMeta = unknown, TProgressData = unknown>(
     isStreaming: currentStreamOwnsState && isStreaming,
     reconnecting: currentStreamOwnsState && reconnecting,
     offset: currentStreamOwnsState ? offset : 0,
+    eventOffset: currentStreamOwnsState ? eventOffset : 0,
     progress: currentStreamOwnsState ? progress : undefined,
   };
 }
