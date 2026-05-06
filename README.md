@@ -19,7 +19,7 @@ If you control both ends and can use plain SSE or streamed `fetch` responses, yo
 ## How it works
 
 ```
-+------------------+      poll every 400ms       +------------------+    long upstream     +------------------+
++------------------+      poll every 400ms       +------------------+   long upstream    +------------------+
 |   React client   | --------------------------> |   stream-relay   | -----------------> |   LLM / agent    |
 |   useStream()    | <-- { append, events }----- |     (server)     | <-- tokens ------- |  / any slow API  |
 +------------------+                             +------------------+                    +------------------+
