@@ -168,6 +168,17 @@ If the relay garbage-collected the buffer before you came back, `onError` fires 
 
 If nobody polls a still-running stream for `streamTtlMs` (10 minutes by default), the relay aborts the upstream via `ctx.signal` and marks the stream as `error`. Upstream handlers should pass `signal` into fetch/SDK calls when possible or check `signal.aborted` in long loops.
 
+For multi-tenant deployments, set `maxBufferSize` to cap each stream's in-memory text buffer. If `write(chunk)` would push the buffer past that limit, the relay aborts the upstream, keeps the buffer at its last valid offset, and polls return `status: "error"`.
+
+```ts
+const { app } = createRelayApp({
+  maxBufferSize: 256_000,
+  upstream: async ({ write, signal }) => {
+    // pass `signal` to upstream SDK/fetch calls when possible
+  },
+});
+```
+
 ## Progress updates
 
 Keep protocol lifecycle separate from app-level progress. `status` stays one of `streaming`, `complete`, `error`, or `not_found`; your upstream can publish custom progress through `progress()` without appending anything to the visible text buffer:
@@ -368,7 +379,7 @@ Full JSDoc on every option in [`packages/client/index.ts`](./packages/client/ind
 
 ### `createRelay(options)` from `@hs-uix/stream-relay/server`
 
-Framework-agnostic core if you're rolling your own HTTP layer. Returns `{ handleStart, handlePoll }` as pure async functions. `streamTtlMs` controls both finished-buffer retention and inactivity aborts for still-running streams.
+Framework-agnostic core if you're rolling your own HTTP layer. Returns `{ handleStart, handlePoll }` as pure async functions. `streamTtlMs` controls both finished-buffer retention and inactivity aborts for still-running streams. `maxBufferSize` optionally caps the per-stream text buffer and aborts with `status: "error"` if an upstream write would exceed it.
 
 ### `createRelayApp(options)` from `@hs-uix/stream-relay/hono`
 

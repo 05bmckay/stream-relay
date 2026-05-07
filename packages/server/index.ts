@@ -71,6 +71,14 @@ export interface RelayOptions<TPayload = unknown, TMeta = unknown> {
   streamTtlMs?: number;
 
   /**
+   * Maximum in-memory text buffer size per stream, measured in JavaScript
+   * string length (UTF-16 code units). When a write would exceed this limit,
+   * the relay aborts the upstream and marks the stream as `error`. Undefined
+   * keeps the historical unbounded behavior.
+   */
+  maxBufferSize?: number;
+
+  /**
    * Optional persistence hooks. All async, all best-effort: the relay logs
    * failures and continues. None of these are required for correctness;
    * they exist so durable backends can layer on without forking.
@@ -160,6 +168,10 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
 ): Relay {
   const streams = new Map<string, StreamRecord<TMeta>>();
   const ttl = options.streamTtlMs ?? DEFAULT_TTL_MS;
+  const maxBufferSize = options.maxBufferSize;
+  if (maxBufferSize !== undefined && (!Number.isFinite(maxBufferSize) || maxBufferSize < 0)) {
+    throw new Error("maxBufferSize must be a finite non-negative number");
+  }
   const genId =
     options.generateId ??
     (() => {
@@ -199,14 +211,7 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
         return;
       }
 
-      const message = "stream aborted after client inactivity";
-      rec.status = "error";
-      rec.error = message;
-      rec.lastEventAt = now;
-      rec.abort.abort();
-      if (options.onError) {
-        queueHook(rec, "onError", () => options.onError!(rec.streamId, message));
-      }
+      markStreamError(rec, "stream aborted after client inactivity", now);
     }, ttl);
   }
 
@@ -256,6 +261,25 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
     rec.hookQueue = next;
   }
 
+  function markStreamError(
+    rec: StreamRecord<TMeta>,
+    message: string,
+    timestamp = Date.now(),
+  ): void {
+    if (rec.status !== "streaming") return;
+    if (rec.inactivityTimer) {
+      clearTimeout(rec.inactivityTimer);
+      rec.inactivityTimer = undefined;
+    }
+    rec.status = "error";
+    rec.error = message;
+    rec.lastEventAt = timestamp;
+    rec.abort.abort();
+    if (options.onError) {
+      queueHook(rec, "onError", () => options.onError!(rec.streamId, message));
+    }
+  }
+
   async function runUpstream(
     rec: StreamRecord<TMeta>,
     payload: TPayload,
@@ -265,6 +289,10 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
       payload,
       write: (chunk) => {
         if (rec.status !== "streaming") return;
+        if (maxBufferSize !== undefined && rec.buffer.length + chunk.length > maxBufferSize) {
+          markStreamError(rec, `stream buffer exceeded maxBufferSize (${maxBufferSize})`);
+          return;
+        }
         rec.buffer += chunk;
         rec.lastEventAt = Date.now();
         if (options.onAppend) {
@@ -327,12 +355,7 @@ export function createRelay<TPayload = unknown, TMeta = unknown>(
         rec.inactivityTimer = undefined;
       }
       const message = err instanceof Error ? err.message : String(err);
-      rec.status = "error";
-      rec.error = message;
-      rec.lastEventAt = Date.now();
-      if (options.onError) {
-        queueHook(rec, "onError", () => options.onError!(rec.streamId, message));
-      }
+      markStreamError(rec, message);
     }
   }
 
